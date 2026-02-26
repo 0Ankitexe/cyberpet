@@ -1,0 +1,49 @@
+[general]
+pet_name = "Byte"
+log_level = "INFO"
+log_path = "/var/log/cyberpet/"
+pid_file = "/var/run/cyberpet.pid"
+event_stream_socket = "/var/run/cyberpet_events.sock"
+event_stream_socket_mode = "0666"
+event_stream_socket_group = "cyberpet"
+
+[terminal_guard]
+enabled = true
+socket_path = "/var/run/cyberpet.sock"
+socket_mode = "0666"
+socket_group = "cyberpet"
+block_threshold = 61
+hard_block_threshold = 86
+override_max_failures = 3
+allow_override_phrase = "CYBERPET ALLOW"
+
+[ui]
+refresh_rate_ms = 500
+pet_name = "Byte"
+show_allowed_events = false
+
+[scanner]
+quick_scan_interval_minutes = 30
+full_scan_time = "03:00"
+max_file_size_mb = 50
+auto_quarantine = false
+auto_quarantine_threshold = 80
+
+[file_monitor]
+enabled = true
+monitored_paths = ["/etc", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/boot", "/lib"]
+whitelist = ["apt", "apt-get", "dpkg", "dnf", "yum", "rpm", "pip", "pip3", "systemd", "systemctl", "sshd", "cron", "rsyslog"]
+
+[exec_monitor]
+enabled = true
+
+[yara]
+rules_dir = "/etc/cyberpet/rules/"
+scan_timeout_seconds = 30
+
+[quarantine]
+vault_path = "/var/lib/cyberpet/quarantine/"
+
+[hash_db]
+db_path = "/var/lib/cyberpet/hashes.db"
+seed_file = "/etc/cyberpet/seed_hashes.csv"

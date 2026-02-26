@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Environment
+.env
+.env.*
+
+# Logs (local dev)
+*.log
+
+# PID files
+*.pid
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# SQLite databases (runtime-generated)
+*.db
+*.db-wal
+*.db-shm
+
+# Quarantine vault
+quarantine/*.quar
+
+# Sockets
+*.sock
+
+# AI/Spec/Prompt files — not part of the project
+prompts/
+specs/
+.specify/
+.agent/
+.agents/
+_agent/
+_agents/
+.kilocode/
+.pyre_configuration
+pyrightconfig.json
+scanfix.md
+scanui.md

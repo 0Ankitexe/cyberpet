@@ -1,0 +1,253 @@
+/* Scan UI styles for CyberPet / Aegis TUI */
+
+/* ── Scan Menu Modal ────────────────────────────────── */
+
+ScanMenuModal {
+    align: center middle;
+}
+
+ScanMenuModal > Vertical {
+    width: 45;
+    height: auto;
+    max-height: 28;
+    border: double $primary;
+    padding: 1 2;
+    background: $surface;
+}
+
+.scan-title {
+    text-align: center;
+    color: $primary;
+    text-style: bold;
+    padding-bottom: 1;
+    width: 100%;
+}
+
+.scan-btn-quick {
+    width: 100%;
+    margin-bottom: 1;
+    background: $success 20%;
+    border: solid $success;
+    color: $success;
+    min-height: 3;
+}
+
+.scan-btn-quick:hover {
+    background: $success 40%;
+}
+
+.scan-btn-full {
+    width: 100%;
+    margin-bottom: 1;
+    background: $warning 20%;
+    border: solid $warning;
+    color: $warning;
+    min-height: 3;
+}
+
+.scan-btn-full:hover {
+    background: $warning 40%;
+}
+
+.scan-btn-cancel {
+    width: 100%;
+    background: $surface;
+    border: solid $panel;
+    color: $text-muted;
+    min-height: 3;
+}
+
+.scan-btn-cancel:hover {
+    background: $panel;
+}
+
+.scan-desc {
+    text-align: center;
+    color: $text-muted;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+/* ── Scan Screen ────────────────────────────────────── */
+
+ScanScreen {
+    layout: grid;
+    grid-size: 2 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: 1fr auto;
+}
+
+.status-panel {
+    border: solid $primary;
+    padding: 1;
+    row-span: 1;
+    column-span: 1;
+}
+
+.threats-panel {
+    border: solid $warning;
+    padding: 1;
+    row-span: 1;
+    column-span: 1;
+}
+
+.previous-scan-bar {
+    height: 3;
+    background: $surface;
+    border-top: solid $panel;
+    padding: 0 2;
+    color: $text-muted;
+    column-span: 2;
+}
+
+#start-scan-btn {
+    width: 100%;
+    margin: 1 0;
+    background: $success 20%;
+    border: solid $success;
+    color: $success;
+    min-height: 3;
+}
+
+#start-scan-btn:hover {
+    background: $success 40%;
+}
+
+#start-scan-btn.disabled-btn {
+    background: $surface;
+    border: solid $panel;
+    color: $text-muted;
+}
+
+#cancel-scan-btn {
+    width: 100%;
+    background: $error 20%;
+    border: solid $error;
+    color: $error;
+    min-height: 3;
+}
+
+#cancel-scan-btn:hover {
+    background: $error 40%;
+}
+
+#cancel-scan-btn.disabled-btn {
+    background: $surface;
+    border: solid $panel;
+    color: $text-muted;
+}
+
+.status-label {
+    text-style: bold;
+    padding: 0 0 1 0;
+}
+
+.status-scanning {
+    color: $primary;
+}
+
+.status-complete {
+    color: $success;
+}
+
+.status-cancelled {
+    color: $warning;
+}
+
+.status-threat {
+    color: $error;
+    text-style: bold;
+}
+
+.threat-item {
+    padding: 0 1;
+    height: 3;
+}
+
+.threat-item:hover {
+    background: $primary 15%;
+}
+
+.threat-medium {
+    color: $warning;
+}
+
+.threat-high {
+    color: #ff6600;
+}
+
+.threat-critical {
+    color: $error;
+    text-style: bold;
+}
+
+.threat-handled {
+    color: $text-muted;
+    text-style: dim italic;
+}
+
+/* ── Threat Action Modal ────────────────────────────── */
+
+ThreatActionModal {
+    align: center middle;
+}
+
+ThreatActionModal > Vertical {
+    width: 55;
+    height: auto;
+    max-height: 30;
+    border: double $error;
+    padding: 1 2;
+    background: $surface;
+}
+
+.threat-title {
+    text-align: center;
+    color: $error;
+    text-style: bold;
+    padding-bottom: 1;
+    width: 100%;
+}
+
+.threat-detail {
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+.btn-quarantine {
+    width: 100%;
+    margin-bottom: 1;
+    background: $error 20%;
+    border: solid $error;
+    color: $error;
+    min-height: 3;
+}
+
+.btn-quarantine:hover {
+    background: $error 40%;
+}
+
+.btn-mark-safe {
+    width: 100%;
+    margin-bottom: 1;
+    background: $success 20%;
+    border: solid $success;
+    color: $success;
+    min-height: 3;
+}
+
+.btn-mark-safe:hover {
+    background: $success 40%;
+}
+
+.btn-back {
+    width: 100%;
+    background: $surface;
+    border: solid $panel;
+    color: $text-muted;
+    min-height: 3;
+}
+
+.btn-back:hover {
+    background: $panel;
+}

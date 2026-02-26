@@ -1,0 +1,1 @@
+"""CyberPet Terminal UI package."""

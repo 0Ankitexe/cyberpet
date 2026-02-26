@@ -1,0 +1,15 @@
+[Unit]
+Description=CyberPet Security Daemon v1
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/cyberpet.pid
+ExecStart=/usr/local/bin/cyberpet start
+ExecStop=/usr/local/bin/cyberpet stop
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
