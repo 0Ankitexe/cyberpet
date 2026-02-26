@@ -52,17 +52,3 @@ quarantine/*.quar
 
 # Sockets
 *.sock
-
-# AI/Spec/Prompt files — not part of the project
-prompts/
-specs/
-.specify/
-.agent/
-.agents/
-_agent/
-_agents/
-.kilocode/
-.pyre_configuration
-pyrightconfig.json
-scanfix.md
-scanui.md
