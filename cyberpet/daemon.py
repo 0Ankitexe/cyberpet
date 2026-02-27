@@ -461,6 +461,8 @@ class CyberPetDaemon:
     async def _rl_loop(self) -> None:
         """Run RL decision cycle every N seconds (V3)."""
         interval = self.config.rl.get("decision_interval_seconds", 30)
+        model_dir = self.config.rl.get("model_path", "/var/lib/cyberpet/models/")
+        state_file = os.path.join(model_dir, "rl_state.json")
         try:
             while self._running and self._rl_engine:
                 step_info = self._rl_engine.run_step()
@@ -476,6 +478,22 @@ class CyberPetDaemon:
                 self.pet_state.rl_state = (
                     "WARMUP" if self._rl_engine.is_warmup else "TRAINING"
                 )
+
+                # Write rl_state.json for CLI `model status` command
+                try:
+                    import json as _json
+                    _json.dump(
+                        {
+                            "total_steps": self._rl_engine.total_steps,
+                            "avg_reward": round(self._rl_engine.avg_reward, 4),
+                            "rl_state": self.pet_state.rl_state,
+                            "last_action": step_info.get("action_name", ""),
+                            "warmup_remaining": self._rl_engine.warmup_remaining,
+                        },
+                        open(state_file, "w"),
+                    )
+                except Exception:
+                    pass
 
                 # Publish RL_DECISION event
                 await self.event_bus.publish(Event(

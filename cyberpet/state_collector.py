@@ -163,7 +163,8 @@ class SystemStateCollector:
         vec[33] = _clip(self._count_recent(self._exec_blocks_hour, now) / 50.0)
         vec[34] = _clip(self._pet.last_scan_threats_found / 20.0)
         vec[35] = _clip(self._anomaly_score)
-        vec[36] = _clip(self._pet.files_quarantined / 50.0)     # quarantine_count_active
+        vec[36] = 1.0 if (self._pet.last_scan_type and
+                          time.time() - self._pet.last_scan_time < 600) else 0.0  # scan_in_progress
 
         # ── Group 7: Time context (37-41) ──
         import datetime as _dt

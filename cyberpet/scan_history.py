@@ -209,5 +209,27 @@ class ScanHistory:
             for r in rows
         ]
 
+    def get_threats_for_scan(self, scan_run_id: int) -> list[dict[str, Any]]:
+        """Return all threat records for a given scan run."""
+        rows = self._conn.execute(
+            """SELECT filepath, sha256, threat_score, threat_category,
+                      threat_reason, matched_rules, action_taken, action_at
+               FROM scan_threats WHERE scan_run_id = ?""",
+            (scan_run_id,),
+        ).fetchall()
+        return [
+            {
+                "filepath": r[0],
+                "file_hash": r[1],
+                "threat_score": r[2],
+                "threat_category": r[3],
+                "threat_reason": r[4],
+                "matched_rules": r[5],
+                "action_taken": r[6],
+                "action_at": r[7],
+            }
+            for r in rows
+        ]
+
     def close(self) -> None:
         self._conn.close()

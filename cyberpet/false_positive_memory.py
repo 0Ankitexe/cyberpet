@@ -130,6 +130,35 @@ class FalsePositiveMemory:
             return row is not None
         return False
 
+    def get_all_false_positives(self) -> list[dict[str, Any]]:
+        """Return all false positive entries as a list of dicts."""
+        rows = self._conn.execute(
+            """SELECT sha256, filepath, threat_category, threat_score,
+                      matched_rules, marked_safe_at, mark_count
+               FROM false_positives ORDER BY id DESC""",
+        ).fetchall()
+        return [
+            {
+                "sha256": r[0],
+                "filepath": r[1],
+                "threat_category": r[2],
+                "threat_score": r[3],
+                "matched_rules": r[4],
+                "added_at": r[5],
+                "mark_count": r[6],
+            }
+            for r in rows
+        ]
+
+    def clear_all(self) -> int:
+        """Delete all FP and quarantine confirmation entries. Returns count deleted."""
+        cur = self._conn.execute("SELECT COUNT(*) FROM false_positives")
+        count = cur.fetchone()[0]
+        self._conn.execute("DELETE FROM false_positives")
+        self._conn.execute("DELETE FROM quarantine_confirmations")
+        self._conn.commit()
+        return count
+
     def get_false_positive_patterns(self) -> dict[str, Any]:
         """Return aggregated FP patterns for analysis / RL."""
         rows = self._conn.execute(
@@ -163,7 +192,15 @@ class FalsePositiveMemory:
     # RL export
     # ------------------------------------------------------------------
 
-    def _export_for_rl(self) -> None:
+    def export_for_rl(self) -> dict[str, Any]:
+        """Export all decision data for RL prior loading.
+
+        Returns a dict with safe_hashes, safe_paths, confirmed_threats,
+        fp_categories, and fp_rules.
+        """
+        return self._export_for_rl()
+
+    def _export_for_rl(self) -> dict[str, Any]:
         """Export all decision data to JSON for future RL training."""
         fp_rows = self._conn.execute(
             "SELECT sha256, filepath, threat_category, matched_rules FROM false_positives",
@@ -196,6 +233,8 @@ class FalsePositiveMemory:
                 json.dump(data, f, indent=2)
         except OSError:
             pass  # non-critical — tolerate permission issues
+
+        return data
 
     def close(self) -> None:
         self._conn.close()
