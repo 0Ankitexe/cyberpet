@@ -46,10 +46,15 @@ if command -v apt-get &>/dev/null; then
     apt-get update -qq
     apt-get install -y -qq bcc python3-bpfcc 2>/dev/null || warn "BCC not available — syscall anomaly monitor will be disabled"
     apt-get install -y -qq "linux-headers-$(uname -r)" 2>/dev/null || warn "linux-headers not available — eBPF may not work"
+    # C++ compiler needed for numpy source builds
+    apt-get install -y -qq g++ 2>/dev/null || warn "g++ not available — numpy must install from wheel"
 elif command -v dnf &>/dev/null; then
     dnf install -y -q bcc bcc-tools 2>/dev/null || warn "BCC not available"
+    # C++ compiler needed for numpy source builds
+    dnf install -y -q gcc-c++ 2>/dev/null || warn "gcc-c++ not available — numpy must install from wheel"
 elif command -v yum &>/dev/null; then
     yum install -y -q bcc bcc-tools 2>/dev/null || warn "BCC not available"
+    yum install -y -q gcc-c++ 2>/dev/null || warn "gcc-c++ not available — numpy must install from wheel"
 fi
 info "System dependencies checked"
 
@@ -68,12 +73,13 @@ step "Installing V3 Python dependencies (RL brain)"
 }
 
 # Install numpy first — it is a build-time dep for SB3 and gymnasium
-/opt/cyberpet/venv/bin/pip install -q "numpy>=1.21.0,<2.0.0" || warn "numpy install failed"
+# --prefer-binary: use pre-compiled wheel, avoid building from source (needs g++)
+/opt/cyberpet/venv/bin/pip install -q --prefer-binary "numpy>=1.21.0,<2.0.0" || warn "numpy install failed"
 
 # Install RL dependencies
 # Note: stable-baselines3 WITHOUT [extra] — the extras pull pygame which
 # requires a C compiler and is not needed for CyberPet's RL brain
-/opt/cyberpet/venv/bin/pip install -q \
+/opt/cyberpet/venv/bin/pip install -q --prefer-binary \
     "stable-baselines3>=2.0.0,<3.0.0" \
     "gymnasium>=0.26.0,<1.0.0" \
     "shimmy>=1.0.0,<2.0.0" \
