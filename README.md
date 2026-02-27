@@ -2,7 +2,7 @@
 
 > A terminal-based cybersecurity daemon for Linux that guards your system while living as an ASCII pet in your terminal.
 
-CyberPet intercepts dangerous commands, scans for malware, monitors process execution via eBPF, and blocks suspicious file access using fanotify — all while displaying an interactive ASCII pet whose mood reflects your system's security health.
+CyberPet intercepts dangerous commands, scans for malware, monitors process execution via eBPF, blocks suspicious file access using fanotify, and **learns from your decisions with a reinforcement learning brain** — all while displaying an interactive ASCII pet whose mood reflects your system's security health.
 
 **Linux only** — relies on Unix domain sockets, `/proc`, eBPF, and fanotify.
 
@@ -32,6 +32,19 @@ CyberPet intercepts dangerous commands, scans for malware, monitors process exec
 
 All features **degrade gracefully** — if eBPF, fanotify, YARA, or the package manager aren't available, the system continues working with reduced capabilities.
 
+### V3 — The RL Brain
+- **Reinforcement Learning Engine** — PPO-based brain (stable-baselines3) that learns optimal threat responses from real system events
+- **Prior Knowledge Bootstrap** — Loads human-confirmed decisions from FP memory and scan history to avoid blind starts
+- **44-Feature State Vector** — Comprehensive system observation including CPU, RAM, network, threats, scan quality, and FP rate
+- **8 Action Types** — ALLOW, LOG_WARN, BLOCK_PROCESS, QUARANTINE_FILE, NETWORK_ISOLATE, RESTORE_FILE, TRIGGER_SCAN, ESCALATE_LOCKDOWN
+- **False Positive Protection** — Multi-layer FP checks (FP memory + prior safe set + hash matching) before every blocking action
+- **Syscall Anomaly Monitor** — eBPF-based detection of PTRACE_ABUSE, FORK_BOMB, MEMFD_MALWARE, MMAP_EXEC, PERSONA_TRICK
+- **Decision Explainability** — Human-readable explanations for every RL decision citing elevated features
+- **TUI Brain Panel** — Live RL stats (steps, action, reward, state) with action distribution bar chart
+- **CLI Commands** — `model status/reset/info`, `fp list/clear`
+- **Dynamic Warmup** — 100/50/25 steps based on prior knowledge depth
+- **Model Persistence** — PPO model saved on clean shutdown, restored on restart
+
 ---
 
 ## 🚀 Quick Start
@@ -54,6 +67,9 @@ sudo ./install_v1.sh
 
 # Install V2 (scanner, YARA, quarantine, eBPF, fanotify)
 sudo ./install_v2.sh
+
+# Install V3 (RL brain, syscall monitor, explainability)
+sudo ./install_v3.sh
 ```
 
 ### Usage
@@ -70,6 +86,12 @@ cyberpet scan quick
 
 # Run a full filesystem scan
 cyberpet scan full
+
+# Check RL brain status (V3)
+cyberpet model status
+
+# View RL brain architecture (V3)
+cyberpet model info
 ```
 
 ### Shell Hook
@@ -116,6 +138,11 @@ When you press ESC during a scan, it continues running in the background — the
 | `cyberpet quarantine list`         | List all quarantined files                  |
 | `cyberpet quarantine restore <id>` | Restore a quarantined file                  |
 | `cyberpet quarantine delete <id>`  | Permanently delete a quarantined file       |
+| `cyberpet model status`            | Show RL brain status and FP analysis (V3)   |
+| `cyberpet model reset`             | Delete trained RL model (V3)                |
+| `cyberpet model info`              | Display PPO architecture details (V3)       |
+| `cyberpet fp list`                 | List false positive memory entries (V3)     |
+| `cyberpet fp clear`                | Clear all FP memory entries (V3)            |
 
 ---
 
@@ -151,6 +178,17 @@ scan_timeout_seconds = 30
 
 [quarantine]
 vault_path = "/var/lib/cyberpet/quarantine/"
+
+# V3: RL Brain
+[rl]
+enabled = true
+model_path = "/var/lib/cyberpet/models/"
+decision_interval_seconds = 30
+checkpoint_interval_steps = 3600
+warmup_steps_no_priors = 100
+warmup_steps_with_priors = 50
+warmup_steps_deep_priors = 25
+deep_prior_threshold = 20
 ```
 
 ### Key Config Options
@@ -159,6 +197,9 @@ vault_path = "/var/lib/cyberpet/quarantine/"
 - **block_threshold** — Minimum danger score to block a command (0-100)
 - **quick_scan_interval_minutes** — How often the daemon runs background quick scans
 - **full_scan_time** — Time of day for the automatic full scan (HH:MM format)
+- **rl.enabled** — Enable/disable the RL brain (V3; defaults to `true`)
+- **rl.decision_interval_seconds** — How often the RL brain makes decisions (V3; default: 30s)
+- **rl.warmup_steps_no_priors** — Warmup steps when no prior knowledge exists (V3; default: 100)
 
 ---
 
@@ -173,13 +214,19 @@ vault_path = "/var/lib/cyberpet/quarantine/"
 │                ↕ EventBus                            │
 ├────────┬──────────┬──────────┬───────────────────────┤
 │ Logger │  Pet UI  │  Stats   │   Scan Scheduler      │
-│        │  [S]Scan │          │                       │
+│        │  [S]Scan │  Brain   │                       │
 ├────────┴──────────┴──────────┴───────────────────────┤
-│           Kernel Monitoring Layer                    │
+│              V3: RL Brain                            │
 ├─────────────────────┬────────────────────────────────┤
-│ eBPF Exec Monitor   │  fanotify File Monitor         │
-│ (sched_process_exec)│  (FAN_OPEN_PERM/ACCESS_PERM)   │
+│ RLEngine (PPO)      │  ActionExecutor (8 actions)    │
+│ RLExplainer         │  RLPriorKnowledge              │
+│ CyberPetEnv (Gym)   │  SystemStateCollector (44-dim) │
 ├─────────────────────┴────────────────────────────────┤
+│           Kernel Monitoring Layer                    │
+├─────────────┬──────────────┬─────────────────────────┤
+│ eBPF Exec   │  Syscall     │  fanotify File Monitor  │
+│ Monitor     │  Anomaly (V3)│  (FAN_OPEN_PERM)        │
+├─────────────┴──────────────┴─────────────────────────┤
 │         File Scanner (11-stage pipeline)             │
 │ Pre-filter → Hash → Pkg Trust → YARA → Entropy       │
 │          → Magic → ELF → Combine → Context           │
@@ -212,12 +259,19 @@ cyberpet/
 ├── scan_scheduler.py         # Scheduled scanning
 ├── scan_history.py           # Scan history store
 ├── false_positive_memory.py  # FP decisions + RL export
+├── rl_prior.py               # V3: Prior knowledge bootstrap
+├── state_collector.py        # V3: 44-feature state vector
+├── rl_env.py                 # V3: Custom Gymnasium environment
+├── rl_engine.py              # V3: PPO engine with persistence
+├── action_executor.py        # V3: 8-action executor + FP protection
+├── rl_explainer.py           # V3: Decision explainability
 ├── ebpf/
 │   ├── exec_monitor.py       # eBPF process monitor
-│   └── file_monitor.py       # fanotify file access monitor
+│   ├── file_monitor.py       # fanotify file access monitor
+│   └── syscall_monitor.py    # V3: eBPF syscall anomaly detector
 └── ui/
     ├── ascii_art.py           # 7 mood faces
-    ├── pet.py                 # Main TUI screen
+    ├── pet.py                 # Main TUI screen + BrainStatsWidget
     ├── scan_menu.py           # Scan type selection modal
     ├── scan_screen.py         # Live scan progress screen
     └── threat_action.py       # Per-threat action modal
@@ -233,6 +287,11 @@ scripts/
 ├── socket_client.py
 └── shell_hook.sh
 tests/
+├── test_rl_prior.py           # V3
+├── test_state_collector.py    # V3
+├── test_rl_env.py             # V3
+├── test_action_executor.py    # V3
+├── test_rl_engine.py          # V3
 └── ...
 ```
 
@@ -262,6 +321,11 @@ tests/
 | `yara-python`   | Recommended | YARA scanning              |
 | `python-magic`  | Recommended | File type detection        |
 | `pyelftools`    | Recommended | ELF binary analysis        |
+| `stable-baselines3` | V3     | PPO reinforcement learning |
+| `torch` (CPU)   | V3          | Neural network backend     |
+| `gymnasium`     | V3          | RL environment framework   |
+| `numpy`         | V3          | Numerical computation      |
+| `shimmy`        | V3          | Gym compatibility layer    |
 
 ---
 

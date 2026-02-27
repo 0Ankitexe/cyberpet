@@ -1,0 +1,414 @@
+"""RL Action Executor for CyberPet V3.
+
+Executes the 8 discrete RL actions with multi-layer false-positive
+protection.  Before any blocking action the executor checks:
+  1. Existing whitelist
+  2. FalsePositiveMemory safe set
+  3. Prior-knowledge safe hashes
+If any match, the action is aborted with ``false_positive=True``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import signal
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from cyberpet.events import Event, EventBus, EventType
+
+if TYPE_CHECKING:
+    from cyberpet.false_positive_memory import FalsePositiveMemory
+    from cyberpet.quarantine import QuarantineVault
+    from cyberpet.rl_prior import RLPriorKnowledge
+    from cyberpet.state import PetState
+
+logger = logging.getLogger("cyberpet.action_executor")
+
+# Action index → name
+ACTION_NAMES: dict[int, str] = {
+    0: "ALLOW",
+    1: "LOG_WARN",
+    2: "BLOCK_PROCESS",
+    3: "QUARANTINE_FILE",
+    4: "NETWORK_ISOLATE",
+    5: "RESTORE_FILE",
+    6: "TRIGGER_SCAN",
+    7: "ESCALATE_LOCKDOWN",
+}
+
+
+@dataclass
+class ActionResult:
+    """Outcome of executing an RL action."""
+
+    action: int = 0
+    success: bool = True
+    confirmed_threat: bool = False
+    suspicious_detected: bool = False
+    false_positive: bool = False
+    target_in_fp_memory: bool = False
+    threat_category: str = ""
+    missed_threat: bool = False
+    confidence_scale: float = 1.0
+    details: str = ""
+
+
+class ActionExecutor:
+    """Execute RL-selected actions with FP protection.
+
+    Parameters
+    ----------
+    event_bus : EventBus
+        For publishing action events.
+    quarantine_vault : QuarantineVault | None
+        Used by quarantine/restore actions.  Can be ``None`` in tests.
+    fp_memory : FalsePositiveMemory
+        Shared FP memory for safe-file checks.
+    prior : RLPriorKnowledge
+        Pre-loaded safe-file penalty set.
+    pet_state : PetState
+        Mutable runtime state.
+    """
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        quarantine_vault: Any,
+        fp_memory: Any,
+        prior: Any,
+        pet_state: Any,
+    ) -> None:
+        self._bus = event_bus
+        self._vault = quarantine_vault
+        self._fp = fp_memory
+        self._prior = prior
+        self._pet = pet_state
+
+        # Safe set from prior knowledge (sha256, filepath)
+        try:
+            self._safe_set: set[tuple[str, str]] = prior.get_safe_file_penalty_set()
+        except Exception:
+            self._safe_set = set()
+
+        # Current target context, set externally before execute()
+        self._current_target: dict[str, str] = {}
+
+        # Dispatch table
+        self._dispatch = {
+            0: self._action_allow,
+            1: self._action_log_warn,
+            2: self._action_block_process,
+            3: self._action_quarantine_file,
+            4: self._action_network_isolate,
+            5: self._action_restore_file,
+            6: self._action_trigger_scan,
+            7: self._action_escalate_lockdown,
+        }
+
+    def set_target(self, target: dict[str, str]) -> None:
+        """Set current threat target context for next execute() call."""
+        self._current_target = target
+
+    def add_to_safe_set(self, sha256: str, filepath: str) -> None:
+        """Add a file to the in-memory safe set (real-time FP update)."""
+        self._safe_set.add((sha256, filepath))
+
+    def execute(self, action: int) -> ActionResult:
+        """Execute the given action index (0-7).
+
+        Returns an ActionResult describing the outcome.
+        """
+        handler = self._dispatch.get(action, self._action_allow)
+        return handler(action)
+
+    # ── FP protection ──────────────────────────────────────────────────
+
+    def _check_fp(self, action: int) -> ActionResult | None:
+        """Check if current target is in any safe list.
+
+        Returns an abort ActionResult if the target is safe, else None.
+        """
+        filepath = self._current_target.get("filepath", "")
+        sha256 = self._current_target.get("sha256", "")
+
+        # Check FP memory
+        try:
+            if filepath and self._fp.is_known_false_positive(sha256, filepath):
+                logger.info(f"FP abort: {filepath} is in FP memory")
+                return ActionResult(
+                    action=action,
+                    success=False,
+                    false_positive=True,
+                    target_in_fp_memory=True,
+                    details=f"Aborted: {filepath} is in FP memory",
+                )
+        except Exception:
+            pass
+
+        # Check prior safe set
+        if (sha256, filepath) in self._safe_set:
+            logger.info(f"FP abort: {filepath} is in prior safe set")
+            return ActionResult(
+                action=action,
+                success=False,
+                false_positive=True,
+                target_in_fp_memory=True,
+                details=f"Aborted: {filepath} is in prior safe set",
+            )
+
+        # Check by hash alone
+        for safe_sha, safe_path in self._safe_set:
+            if sha256 and sha256 == safe_sha:
+                return ActionResult(
+                    action=action,
+                    success=False,
+                    false_positive=True,
+                    target_in_fp_memory=True,
+                    details=f"Aborted: hash {sha256[:8]} in safe set",
+                )
+
+        return None
+
+    # ── Action implementations ─────────────────────────────────────────
+
+    def _action_allow(self, action: int) -> ActionResult:
+        return ActionResult(action=action, success=True, details="No action taken")
+
+    def _action_log_warn(self, action: int) -> ActionResult:
+        filepath = self._current_target.get("filepath", "unknown")
+        logger.warning(f"RL LOG_WARN: suspicious activity on {filepath}")
+        return ActionResult(
+            action=action,
+            success=True,
+            suspicious_detected=True,
+            details=f"Warning logged for {filepath}",
+        )
+
+    def _action_block_process(self, action: int) -> ActionResult:
+        fp_check = self._check_fp(action)
+        if fp_check:
+            return fp_check
+
+        pid = self._current_target.get("pid")
+        if not pid:
+            return ActionResult(
+                action=action, success=False, details="No PID to block"
+            )
+
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            self._pet.threats_blocked += 1
+            return ActionResult(
+                action=action,
+                success=True,
+                confirmed_threat=True,
+                threat_category=self._current_target.get("category", ""),
+                details=f"Blocked process {pid}",
+            )
+        except (ProcessLookupError, PermissionError, ValueError) as exc:
+            return ActionResult(
+                action=action, success=False, details=f"Block failed: {exc}"
+            )
+
+    def _action_quarantine_file(self, action: int) -> ActionResult:
+        fp_check = self._check_fp(action)
+        if fp_check:
+            return fp_check
+
+        filepath = self._current_target.get("filepath", "")
+        if not filepath or not os.path.exists(filepath):
+            return ActionResult(
+                action=action, success=False,
+                details=f"File not found: {filepath}",
+            )
+
+        try:
+            # Build a minimal threat record for the vault
+            threat = type("ThreatRecord", (), {
+                "filepath": filepath,
+                "threat_score": int(self._current_target.get("threat_score", 50)),
+                "threat_category": self._current_target.get("category", "rl_decision"),
+                "threat_reason": "RL quarantine decision",
+                "matched_rules": [],
+                "sha256": self._current_target.get("sha256", ""),
+            })()
+
+            if self._vault:
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._vault.quarantine_file(filepath, threat))
+                except RuntimeError:
+                    pass
+
+            self._pet.files_quarantined += 1
+
+            # Record confirmation in FP memory
+            try:
+                self._fp.record_quarantine_confirmation(threat)
+            except Exception:
+                pass
+
+            # Publish QUARANTINE_CONFIRMED event
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._bus.publish(Event(
+                    type=EventType.QUARANTINE_CONFIRMED,
+                    source="action_executor",
+                    data={"filepath": filepath,
+                          "sha256": self._current_target.get("sha256", ""),
+                          "category": self._current_target.get("category", "")},
+                    severity=70,
+                )))
+            except RuntimeError:
+                pass
+
+            return ActionResult(
+                action=action,
+                success=True,
+                confirmed_threat=True,
+                threat_category=self._current_target.get("category", ""),
+                details=f"Quarantined {filepath}",
+            )
+        except Exception as exc:
+            return ActionResult(
+                action=action, success=False,
+                details=f"Quarantine failed: {exc}",
+            )
+
+    def _action_network_isolate(self, action: int) -> ActionResult:
+        fp_check = self._check_fp(action)
+        if fp_check:
+            return fp_check
+
+        pid = self._current_target.get("pid", "")
+        logger.warning(f"RL NETWORK_ISOLATE: restricting outbound for PID {pid}")
+
+        # Attempt iptables-based isolation for the flagged PID
+        if pid:
+            try:
+                import subprocess
+                uid = self._current_target.get("uid", "")
+                if uid:
+                    subprocess.run(
+                        ["iptables", "-A", "OUTPUT", "-m", "owner",
+                         "--uid-owner", str(uid), "-j", "DROP"],
+                        capture_output=True, timeout=5, check=False,
+                    )
+            except Exception as exc:
+                logger.warning(f"iptables isolation failed: {exc}")
+
+        # Publish LOCKDOWN_ACTIVATED event
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._bus.publish(Event(
+                type=EventType.LOCKDOWN_ACTIVATED,
+                source="action_executor",
+                data={"action": "network_isolate", "pid": pid},
+                severity=80,
+            )))
+        except RuntimeError:
+            pass
+
+        return ActionResult(
+            action=action,
+            success=True,
+            confirmed_threat=True,
+            details=f"Network isolation activated for PID {pid}",
+        )
+
+    def _action_restore_file(self, action: int) -> ActionResult:
+        filepath = self._current_target.get("filepath", "unknown")
+        logger.info(f"RL RESTORE_FILE: {filepath}")
+
+        # Attempt restore from quarantine vault
+        if self._vault and filepath != "unknown":
+            try:
+                import asyncio
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._vault.restore_file(filepath))
+            except (RuntimeError, AttributeError):
+                pass
+
+        # Publish LOCKDOWN_DEACTIVATED event (restore = de-escalation)
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._bus.publish(Event(
+                type=EventType.LOCKDOWN_DEACTIVATED,
+                source="action_executor",
+                data={"action": "restore_file", "filepath": filepath},
+                severity=30,
+            )))
+        except RuntimeError:
+            pass
+
+        return ActionResult(
+            action=action, success=True,
+            details=f"Restore requested for {filepath}",
+        )
+
+    def _action_trigger_scan(self, action: int) -> ActionResult:
+        trigger = "/var/run/cyberpet_scan_trigger"
+        try:
+            with open(trigger, "w") as f:
+                f.write("quick")
+            return ActionResult(
+                action=action, success=True,
+                details="Quick scan triggered",
+            )
+        except OSError:
+            return ActionResult(
+                action=action, success=True,
+                details="Scan trigger attempted (file may not exist)",
+            )
+
+    def _action_escalate_lockdown(self, action: int) -> ActionResult:
+        fp_check = self._check_fp(action)
+        if fp_check:
+            return fp_check
+
+        logger.warning("RL ESCALATE_LOCKDOWN activated")
+
+        # Kill suspicious processes if PIDs are known
+        pid = self._current_target.get("pid", "")
+        if pid:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+
+        # Block non-essential outbound network
+        try:
+            import subprocess
+            subprocess.run(
+                ["iptables", "-A", "OUTPUT", "-p", "tcp",
+                 "--dport", "1:1023", "-j", "DROP"],
+                capture_output=True, timeout=5, check=False,
+            )
+        except Exception as exc:
+            logger.warning(f"Lockdown iptables failed: {exc}")
+
+        # Publish LOCKDOWN_ACTIVATED event
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._bus.publish(Event(
+                type=EventType.LOCKDOWN_ACTIVATED,
+                source="action_executor",
+                data={"action": "escalate_lockdown", "pid": pid},
+                severity=100,
+            )))
+        except RuntimeError:
+            pass
+
+        return ActionResult(
+            action=action,
+            success=True,
+            confirmed_threat=True,
+            details="System lockdown escalated",
+        )

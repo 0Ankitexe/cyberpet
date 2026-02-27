@@ -259,6 +259,50 @@ class EventLogWidget(VerticalScroll):
         self.scroll_end(animate=False)
 
 
+class BrainStatsWidget(Static):
+    """V3: Widget displaying RL brain statistics and action distribution."""
+
+    rl_steps = reactive(0)
+    rl_action = reactive("N/A")
+    rl_reward = reactive(0.0)
+    rl_state = reactive("DISABLED")
+    rl_confidence = reactive(0.0)
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._action_counts: dict[str, int] = {}
+
+    def update_action_counts(self, counts: dict) -> None:
+        self._action_counts = counts
+        self.refresh()
+
+    def render(self) -> str:
+        lines = [
+            "┌─── Brain ──────────────┐",
+            f"│ State  {self.rl_state:<16}│",
+            f"│ Steps  {self.rl_steps:<16}│",
+            f"│ Action {self.rl_action:<16}│",
+            f"│ Reward {self.rl_reward:>+7.2f}{'':>9}│",
+        ]
+
+        # Action distribution bar chart
+        if self._action_counts:
+            total = max(sum(self._action_counts.values()), 1)
+            labels = ["ALW", "LOG", "BLK", "QRN", "NET", "RST", "SCN", "LCK"]
+            bars = []
+            for i, lbl in enumerate(labels):
+                count = self._action_counts.get(str(i), self._action_counts.get(i, 0))
+                pct = count / total if total > 0 else 0
+                bar_len = int(pct * 8)
+                bars.append(f"{lbl}{'█' * bar_len}{'░' * (8 - bar_len)}")
+            lines.append("│ Actions:              │")
+            for b in bars[:4]:
+                lines.append(f"│  {b:<21}│")
+
+        lines.append("└────────────────────────┘")
+        return "\n".join(lines)
+
+
 class ScanStatsWidget(Static):
     """Widget displaying live scan progress or last scan results."""
 
@@ -455,6 +499,7 @@ class CyberPetApp(App):
         with Horizontal(id="top-row"):  # type: ignore[call-arg]
             yield PetFaceWidget(id="pet-panel")  # type: ignore[call-arg]
             yield SystemStatsWidget(id="stats-panel")  # type: ignore[call-arg]
+            yield BrainStatsWidget(id="brain-panel")  # type: ignore[call-arg]
         with Horizontal(id="bottom-row"):  # type: ignore[call-arg]
             yield EventLogWidget(id="event-log")  # type: ignore[call-arg]
             with Vertical(id="scan-section"):  # type: ignore[call-arg]
@@ -914,7 +959,7 @@ class CyberPetApp(App):
         state.uptime_seconds += 2
 
     def _refresh_stats_widget(self) -> None:
-        """Push latest state values into stats widget."""
+        """Push latest state values into stats and brain widgets."""
         state = self.pet_state
         try:
             stats_widget = self.query_one("#stats-panel", SystemStatsWidget)
@@ -923,6 +968,17 @@ class CyberPetApp(App):
             stats_widget.uptime = state.uptime_seconds
             stats_widget.threats = state.threats_blocked
             stats_widget.intercepted = state.commands_intercepted
+        except Exception:
+            pass
+
+        # V3: Update brain widget
+        try:
+            brain = self.query_one("#brain-panel", BrainStatsWidget)
+            brain.rl_steps = state.rl_steps_trained
+            brain.rl_action = state.rl_last_action or "N/A"
+            brain.rl_reward = state.rl_avg_reward
+            brain.rl_state = state.rl_state or "DISABLED"
+            brain.rl_confidence = state.rl_last_confidence
         except Exception:
             pass
 

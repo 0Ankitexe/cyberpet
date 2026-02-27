@@ -43,6 +43,7 @@ class ScanScheduler:
         config: Config,
         event_bus: EventBus,
         pet_state: PetState,
+        fp_memory=None,
     ) -> None:
         self.config = config
         self.event_bus = event_bus
@@ -69,7 +70,8 @@ class ScanScheduler:
             else:
                 log_warn("No YARA rules found or compilation failed", module="scheduler")
 
-        self.scanner = FileScanner(config, event_bus, self.hash_db, self.yara_engine)
+        self.scanner = FileScanner(config, event_bus, self.hash_db, self.yara_engine,
+                                   fp_memory=fp_memory)
         self.quarantine = QuarantineVault(event_bus, vault_path)
 
         # Config

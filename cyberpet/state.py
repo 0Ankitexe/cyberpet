@@ -54,3 +54,9 @@ class PetState:
     files_quarantined: int = 0
     last_threat_name: str = ""
     last_scan_duration: float = 0.0
+    # V3 RL fields
+    rl_steps_trained: int = 0
+    rl_last_action: str = ""
+    rl_last_confidence: float = 0.0
+    rl_avg_reward: float = 0.0
+    rl_state: str = "DISABLED"  # DISABLED, WARMUP, TRAINING

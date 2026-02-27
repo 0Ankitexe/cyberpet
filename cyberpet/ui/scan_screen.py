@@ -769,6 +769,18 @@ class ScanScreen(Screen):
                 )
             self._update_threat_visual(idx, "QUARANTINED")
             self.notify("🔒 File quarantined", severity="information")
+
+            # V3: Publish QUARANTINE_CONFIRMED event for RL brain
+            if self._event_bus:
+                from cyberpet.events import Event, EventType
+                await self._event_bus.publish(Event(
+                    type=EventType.QUARANTINE_CONFIRMED,
+                    source="scan_screen",
+                    data={"filepath": record.filepath,
+                          "sha256": getattr(record, 'sha256', ''),
+                          "category": getattr(record, 'threat_category', '')},
+                    severity=70,
+                ))
         except Exception as exc:
             self.notify(f"Quarantine failed: {exc}", severity="error")
 
@@ -783,6 +795,17 @@ class ScanScreen(Screen):
                 )
             self._update_threat_visual(idx, "SAFE ✓")
             self.notify("✅ Marked safe — CyberPet will remember", severity="information")
+
+            # V3: Publish FP_MARKED_SAFE event for RL brain
+            if self._event_bus:
+                from cyberpet.events import Event, EventType
+                await self._event_bus.publish(Event(
+                    type=EventType.FP_MARKED_SAFE,
+                    source="scan_screen",
+                    data={"filepath": record.filepath,
+                          "sha256": getattr(record, 'sha256', '')},
+                    severity=30,
+                ))
         except Exception as exc:
             self.notify(f"Error: {exc}", severity="error")
 

@@ -150,6 +150,7 @@ class CyberPetDaemon:
         self._exec_monitor = None
         self._file_monitor = None
         self._scan_scheduler = None
+        self._rl_engine = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._start_time = 0.0
@@ -251,15 +252,104 @@ class CyberPetDaemon:
             log_warn(f"File access monitor unavailable: {exc}", module="daemon")
             self._file_monitor = None
 
-        # Start scan scheduler
+        # V3: Start syscall anomaly monitor (degrades gracefully)
+        self._syscall_monitor = None
+        try:
+            from cyberpet.ebpf.syscall_monitor import SyscallAnomalyMonitor
+            self._syscall_monitor = SyscallAnomalyMonitor(self.event_bus, self.config.rl)
+            started = await self._syscall_monitor.start()
+            if started:
+                log_info("Syscall anomaly monitor started", module="daemon")
+            else:
+                self._syscall_monitor = None
+        except Exception as exc:
+            log_warn(f"Syscall anomaly monitor unavailable: {exc}", module="daemon")
+            self._syscall_monitor = None
+
+        # ── V3: Initialize shared FP memory and scan history ────────
+        fp_memory = None
+        scan_history = None
+        try:
+            from cyberpet.false_positive_memory import FalsePositiveMemory
+            from cyberpet.scan_history import ScanHistory
+            fp_memory = FalsePositiveMemory()
+            scan_history = ScanHistory()
+            log_info("FP memory and scan history loaded", module="daemon")
+        except Exception as exc:
+            log_warn(f"FP memory/scan history unavailable: {exc}", module="daemon")
+
+        # Start scan scheduler (with fp_memory if available)
         try:
             from cyberpet.scan_scheduler import ScanScheduler
-            self._scan_scheduler = ScanScheduler(self.config, self.event_bus, self.pet_state)
+            self._scan_scheduler = ScanScheduler(
+                self.config, self.event_bus, self.pet_state,
+                fp_memory=fp_memory,
+            )
             await self._scan_scheduler.start()
             log_info("Scan scheduler started", module="daemon")
         except Exception as exc:
             log_error(f"Failed to start scan scheduler: {exc}", module="daemon")
             self._scan_scheduler = None
+
+        # ── V3: RL Brain Initialization ────────────────────────────────
+        if self.config.rl.get("enabled", False) and fp_memory and scan_history:
+            try:
+                from cyberpet.state_collector import SystemStateCollector
+                from cyberpet.rl_prior import RLPriorKnowledge
+                from cyberpet.action_executor import ActionExecutor
+                from cyberpet.rl_env import CyberPetEnv
+                from cyberpet.rl_engine import RLEngine
+
+                # State collector (subscribes to events)
+                state_collector = SystemStateCollector(self.event_bus, self.pet_state)
+                await state_collector.start()
+
+                # Prior knowledge
+                prior = RLPriorKnowledge(fp_memory, scan_history)
+
+                # Action executor
+                vault = getattr(self._scan_scheduler, 'quarantine', None)
+                action_executor = ActionExecutor(
+                    self.event_bus, vault, fp_memory, prior, self.pet_state,
+                )
+
+                # Gymnasium environment
+                env = CyberPetEnv(
+                    state_collector, action_executor, fp_memory, prior, self.config,
+                )
+
+                # RL Engine
+                self._rl_engine = RLEngine(
+                    self.config, self.event_bus, fp_memory, scan_history,
+                )
+                self._rl_engine.initialize()
+                self._rl_engine.set_env(env)
+
+                # Update pet state
+                self.pet_state.rl_state = (
+                    "WARMUP" if self._rl_engine.is_warmup else "TRAINING"
+                )
+
+                # Start RL loop and FP event listener
+                rl_task = asyncio.create_task(self._rl_loop())
+                self._tasks.append(rl_task)
+                fp_task = asyncio.create_task(self._fp_event_listener())
+                self._tasks.append(fp_task)
+
+                log_info(
+                    f"RL engine initialized (warmup: {self._rl_engine.warmup_remaining} steps)",
+                    module="daemon",
+                )
+            except ImportError as exc:
+                log_warn(f"RL dependencies not available: {exc}", module="daemon")
+                self.pet_state.rl_state = "DISABLED"
+            except Exception as exc:
+                log_error(f"RL engine initialization failed: {exc}", module="daemon")
+                self.pet_state.rl_state = "DISABLED"
+        else:
+            if not self.config.rl.get("enabled", False):
+                log_info("RL engine disabled by config", module="daemon")
+            self.pet_state.rl_state = "DISABLED"
 
         log_info(f"CyberPet daemon started (PID: {os.getpid()})", module="daemon")
 
@@ -284,6 +374,14 @@ class CyberPetDaemon:
         sig_name = sig.name if sig else "manual"
         log_info(f"Shutting down (signal: {sig_name})...", module="daemon")
         self._running = False
+
+        # Save RL model on shutdown
+        if self._rl_engine:
+            try:
+                self._rl_engine.shutdown()
+                log_info("RL engine shut down and model saved", module="daemon")
+            except Exception as exc:
+                log_error(f"Error saving RL model: {exc}", module="daemon")
 
         # Stop V2 modules
         if self._scan_scheduler:
@@ -357,6 +455,49 @@ class CyberPetDaemon:
             while self._running:
                 self.pet_state.uptime_seconds = int(time.time() - self._start_time)
                 await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+
+    async def _rl_loop(self) -> None:
+        """Run RL decision cycle every N seconds (V3)."""
+        interval = self.config.rl.get("decision_interval_seconds", 30)
+        try:
+            while self._running and self._rl_engine:
+                step_info = self._rl_engine.run_step()
+
+                # Update pet state
+                self.pet_state.rl_steps_trained = self._rl_engine.total_steps
+                self.pet_state.rl_last_action = step_info.get("action_name", "")
+                self.pet_state.rl_avg_reward = self._rl_engine.avg_reward
+                details = step_info.get("details", {})
+                self.pet_state.rl_last_confidence = details.get(
+                    "confidence", 0.0
+                ) if isinstance(details, dict) else 0.0
+                self.pet_state.rl_state = (
+                    "WARMUP" if self._rl_engine.is_warmup else "TRAINING"
+                )
+
+                # Publish RL_DECISION event
+                await self.event_bus.publish(Event(
+                    type=EventType.RL_DECISION,
+                    source="rl_engine",
+                    data=step_info,
+                    severity=0,
+                ))
+
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+
+    async def _fp_event_listener(self) -> None:
+        """Subscribe to FP_MARKED_SAFE events and forward to RL engine (V3)."""
+        try:
+            async for event in self.event_bus.subscribe():
+                if event.type == EventType.FP_MARKED_SAFE and self._rl_engine:
+                    sha256 = event.data.get("sha256", "")
+                    filepath = event.data.get("filepath", "")
+                    if sha256 or filepath:
+                        self._rl_engine.handle_fp_marked_safe(sha256, filepath)
         except asyncio.CancelledError:
             pass
 

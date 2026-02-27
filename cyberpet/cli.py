@@ -397,5 +397,176 @@ def quarantine_delete(quarantine_id: str) -> None:
         sys.exit(1)
 
 
+# ── V3 RL Model Commands ─────────────────────────────────────────
+
+@main.group()
+def model():
+    """Manage the RL brain model."""
+    pass
+
+
+@model.command("status")
+def model_status():
+    """Show RL brain status and recent activity."""
+    try:
+        from cyberpet.config import Config
+        config = Config()
+        rl_cfg = config.rl
+        model_dir = rl_cfg.get("model_path", "/var/lib/cyberpet/models/")
+        model_file = os.path.join(model_dir, "cyberpet_ppo.zip")
+
+        click.echo("═══ CyberPet RL Brain Status ═══")
+        click.echo()
+
+        if os.path.exists(model_file):
+            stat = os.stat(model_file)
+            size_mb = stat.st_size / (1024 * 1024)
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
+            click.echo(f"  Model:    {model_file}")
+            click.echo(f"  Size:     {size_mb:.1f} MB")
+            click.echo(f"  Updated:  {mtime}")
+        else:
+            click.echo("  Model:    Not found (will be created on first run)")
+
+        click.echo()
+
+        # Try to read state from shared state file
+        state_file = os.path.join(model_dir, "rl_state.json")
+        if os.path.exists(state_file):
+            import json
+            with open(state_file) as f:
+                state = json.load(f)
+            click.echo(f"  Steps:    {state.get('total_steps', 0)}")
+            click.echo(f"  Reward:   {state.get('avg_reward', 0.0):.3f}")
+            click.echo(f"  State:    {state.get('rl_state', 'UNKNOWN')}")
+            click.echo(f"  Action:   {state.get('last_action', 'N/A')}")
+        else:
+            click.echo("  State:    No live state available (daemon may not be running)")
+
+        click.echo()
+
+        # Explainer integration (T041)
+        try:
+            from cyberpet.rl_explainer import RLExplainer
+            explainer = RLExplainer()
+            fp_analysis = explainer.explain_fp_impact()
+            if fp_analysis:
+                click.echo("  FP Analysis:")
+                click.echo(f"    {fp_analysis}")
+        except Exception:
+            pass
+
+        click.echo()
+        click.echo(f"  Enabled:  {rl_cfg.get('enabled', False)}")
+        click.echo(f"  Interval: {rl_cfg.get('decision_interval_seconds', 30)}s")
+
+    except Exception as exc:
+        click.echo(f"Error reading RL status: {exc}", err=True)
+        sys.exit(1)
+
+
+@model.command("reset")
+@click.confirmation_option(
+    prompt="This will delete the trained RL model. Are you sure?"
+)
+def model_reset():
+    """Delete the trained RL model (forces fresh start)."""
+    try:
+        from cyberpet.config import Config
+        config = Config()
+        model_dir = config.rl.get("model_path", "/var/lib/cyberpet/models/")
+        model_file = os.path.join(model_dir, "cyberpet_ppo.zip")
+
+        if os.path.exists(model_file):
+            os.remove(model_file)
+            click.echo(f"Deleted: {model_file}")
+            click.echo("A fresh model will be created on next daemon start.")
+        else:
+            click.echo("No model file found — nothing to reset.")
+
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@model.command("info")
+def model_info():
+    """Display PPO architecture and hyperparameters."""
+    click.echo("═══ CyberPet RL Brain Configuration ═══")
+    click.echo()
+    click.echo("  Algorithm:     PPO (Proximal Policy Optimization)")
+    click.echo("  Policy:        MlpPolicy [256, 256]")
+    click.echo("  Activation:    ReLU")
+    click.echo("  Learning Rate: 3e-4")
+    click.echo("  Batch Size:    64")
+    click.echo("  N Steps:       512")
+    click.echo("  Gamma:         0.99")
+    click.echo("  GAE Lambda:    0.95")
+    click.echo("  Clip Range:    0.2")
+    click.echo("  Entropy Coef:  0.01")
+    click.echo("  Device:        CPU")
+    click.echo()
+    click.echo("  Observation:   Box(0, 1, shape=(44,))")
+    click.echo("  Action Space:  Discrete(8)")
+    click.echo("  Actions:")
+    actions = [
+        "0: ALLOW", "1: LOG_WARN", "2: BLOCK_PROCESS", "3: QUARANTINE_FILE",
+        "4: NETWORK_ISOLATE", "5: RESTORE_FILE", "6: TRIGGER_SCAN",
+        "7: ESCALATE_LOCKDOWN",
+    ]
+    for a in actions:
+        click.echo(f"    {a}")
+
+
+# ── V3 FP Memory Commands ────────────────────────────────────────
+
+@main.group()
+def fp():
+    """Manage false positive memory."""
+    pass
+
+
+@fp.command("list")
+def fp_list():
+    """List all entries in false positive memory."""
+    try:
+        from cyberpet.false_positive_memory import FalsePositiveMemory
+        mem = FalsePositiveMemory()
+        entries = mem.get_all_false_positives()
+
+        if not entries:
+            click.echo("No entries in false positive memory.")
+            return
+
+        click.echo(f"{'SHA256':<16} {'File Path':<50} {'Added':<20}")
+        click.echo("─" * 86)
+        for entry in entries:
+            sha = entry.get("sha256", "")[:16]
+            path = entry.get("filepath", "")[:50]
+            added = entry.get("added_at", "")[:20]
+            click.echo(f"{sha:<16} {path:<50} {added:<20}")
+        click.echo(f"\nTotal: {len(entries)} entries")
+
+    except Exception as exc:
+        click.echo(f"Error reading FP memory: {exc}", err=True)
+        sys.exit(1)
+
+
+@fp.command("clear")
+@click.confirmation_option(
+    prompt="This will clear all false positive entries. Are you sure?"
+)
+def fp_clear():
+    """Clear all entries from false positive memory."""
+    try:
+        from cyberpet.false_positive_memory import FalsePositiveMemory
+        mem = FalsePositiveMemory()
+        count = mem.clear_all()
+        click.echo(f"Cleared {count} entries from false positive memory.")
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
