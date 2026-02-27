@@ -21,6 +21,7 @@ from textual.widgets import Footer, Header, ProgressBar, Static  # type: ignore[
 from cyberpet.events import Event, EventBus, EventType  # type: ignore[import]
 from cyberpet.state import PetState  # type: ignore[import]
 from cyberpet.ui.ascii_art import MoodArt  # type: ignore[import]
+from cyberpet.ui.brain_screen import BrainScreen  # type: ignore[import]
 from cyberpet.ui.scan_menu import ScanMenuModal  # type: ignore[import]
 from cyberpet.ui.scan_screen import ScanScreen  # type: ignore[import]
 
@@ -267,38 +268,59 @@ class BrainStatsWidget(Static):
     rl_reward = reactive(0.0)
     rl_state = reactive("DISABLED")
     rl_confidence = reactive(0.0)
+    rl_warmup_pct = reactive(100)  # 0=start, 100=done
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._action_counts: dict[str, int] = {}
+        self._last_explanation: str = ""
 
     def update_action_counts(self, counts: dict) -> None:
         self._action_counts = counts
         self.refresh()
 
+    def set_last_explanation(self, text: str) -> None:
+        self._last_explanation = text[:60]
+        self.refresh()
+
     def render(self) -> str:
+        steps_fmt = f"{self.rl_steps:,}"
         lines = [
             "┌─── Brain ──────────────┐",
             f"│ State  {self.rl_state:<16}│",
-            f"│ Steps  {self.rl_steps:<16}│",
-            f"│ Action {self.rl_action:<16}│",
-            f"│ Reward {self.rl_reward:>+7.2f}{'':>9}│",
+            f"│ Steps  {steps_fmt:<16}│",
+            f"│ Reward {self.rl_reward:>+7.2f}{'':<9}│",
         ]
 
-        # Action distribution bar chart
+        # Warmup progress bar
+        if self.rl_state == "WARMUP":
+            pct = max(0, min(100, self.rl_warmup_pct))
+            filled = int(pct / 100 * 14)
+            bar = "█" * filled + "░" * (14 - filled)
+            lines.append(f"│ Warmup {bar} {pct:>3}%│")
+
+        # Last action
+        action_display = self.rl_action[:16]
+        lines.append(f"│ Action {action_display:<16}│")
+
+        # Last explanation (truncated)
+        if self._last_explanation:
+            expl = self._last_explanation[:22]
+            lines.append(f"│ {expl:<23}│")
+
+        # Action distribution bar chart (all 8)
         if self._action_counts:
             total = max(sum(self._action_counts.values()), 1)
             labels = ["ALW", "LOG", "BLK", "QRN", "NET", "RST", "SCN", "LCK"]
-            bars = []
+            lines.append("│ ─── Actions ────────── │")
             for i, lbl in enumerate(labels):
                 count = self._action_counts.get(str(i), self._action_counts.get(i, 0))
                 pct = count / total if total > 0 else 0
                 bar_len = int(pct * 8)
-                bars.append(f"{lbl}{'█' * bar_len}{'░' * (8 - bar_len)}")
-            lines.append("│ Actions:              │")
-            for b in bars[:4]:
-                lines.append(f"│  {b:<21}│")
+                bar = "█" * bar_len + "░" * (8 - bar_len)
+                lines.append(f"│  {lbl} {bar} {pct*100:>4.0f}%  │")
 
+        lines.append("│ [b] Brain Details      │")
         lines.append("└────────────────────────┘")
         return "\n".join(lines)
 
@@ -453,12 +475,21 @@ class CyberPetApp(App):
         border: round #444444;
         padding: 0 1;
     }
+
+    #brain-panel {
+        width: 25%;
+        height: 100%;
+        border: round #00ff88;
+        padding: 0 1;
+        overflow-y: auto;
+    }
     """
 
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("d", "toggle_dark", "Toggle Dark"),
         ("s", "open_scan_menu", "Scan"),
+        ("b", "open_brain", "Brain"),
     ]
     _MOOD_EVENT_TYPES = {
         EventType.CMD_BLOCKED,
@@ -799,6 +830,45 @@ class CyberPetApp(App):
                 scan_widget.scan_active = False
             except Exception:
                 pass
+        elif event.type == EventType.RL_DECISION:
+            # V3: Live RL decision event
+            d = event.data
+            state.rl_steps_trained = d.get("step", state.rl_steps_trained)
+            state.rl_last_action = d.get("action_name", state.rl_last_action)
+            state.rl_avg_reward = d.get("avg_reward", state.rl_avg_reward)
+            state.rl_state = "WARMUP" if d.get("warmup", False) else "TRAINING"
+            try:
+                brain = self.query_one("#brain-panel", BrainStatsWidget)
+                brain.rl_steps = state.rl_steps_trained
+                brain.rl_action = state.rl_last_action or "N/A"
+                brain.rl_reward = state.rl_avg_reward
+                brain.rl_state = state.rl_state
+                explanation = d.get("explanation", "")
+                if explanation:
+                    brain.set_last_explanation(explanation)
+                # Update action counts
+                details = d.get("details", {})
+                if isinstance(details, dict):
+                    action_name = d.get("action_name", "")
+                    action_idx = d.get("action", -1)
+                    if action_idx >= 0:
+                        counts = brain._action_counts.copy()
+                        counts[action_idx] = counts.get(action_idx, 0) + 1
+                        brain.update_action_counts(counts)
+                # Warmup percentage
+                warmup_remaining = d.get("warmup_remaining", 0)
+                total_warmup = d.get("total_warmup", 100)
+                if total_warmup > 0:
+                    brain.rl_warmup_pct = max(0, 100 - int(warmup_remaining / total_warmup * 100))
+            except Exception:
+                pass
+            # Push to BrainScreen if open
+            try:
+                screen = self.screen
+                if isinstance(screen, BrainScreen):
+                    screen.push_decision(d)
+            except Exception:
+                pass
         elif event.type == EventType.SYSTEM_STAT_UPDATE:
             state.cpu_percent = event.data.get("cpu", 0.0)
             state.ram_percent = event.data.get("ram", 0.0)
@@ -1029,6 +1099,13 @@ class CyberPetApp(App):
     def action_toggle_dark(self) -> None:
         """Toggle dark mode."""
         self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"
+
+    def action_open_brain(self) -> None:
+        """Open the Brain Screen for detailed RL brain view."""
+        try:
+            self.push_screen(BrainScreen())
+        except Exception as exc:
+            self.notify(f"Brain screen error: {exc}", severity="error")
 
     def action_open_scan_menu(self) -> None:
         """Open the scan type selection modal, or return to active scan."""

@@ -281,12 +281,12 @@ class FileAccessMonitor:
         if lname in self.whitelist:
             return FAN_ALLOW, "", None, 0
 
-        # Whitelist CyberPet's own processes — the daemon runs as Python
-        # and legitimately needs to read system files for scanning
+        # Whitelist CyberPet's own processes — the daemon runs from /opt/cyberpet/
+        # and legitimately needs to read system files for scanning.
+        # NOTE: do NOT whitelist /usr/bin/python here — that would allow any
+        # arbitrary Python script to bypass the shadow/sudoers deny rules.
         _TRUSTED_PROCESS_PATHS = (
             "/opt/cyberpet/",
-            "/usr/bin/python",
-            "/usr/bin/pip",
         )
         if any(process_path.startswith(p) for p in _TRUSTED_PROCESS_PATHS):
             return FAN_ALLOW, "", None, 0

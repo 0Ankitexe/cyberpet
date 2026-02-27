@@ -410,7 +410,7 @@ def model_status():
     """Show RL brain status and recent activity."""
     try:
         from cyberpet.config import Config
-        config = Config()
+        config = Config.load()
         rl_cfg = config.rl
         model_dir = rl_cfg.get("model_path", "/var/lib/cyberpet/models/")
         model_file = os.path.join(model_dir, "cyberpet_ppo.zip")
@@ -473,7 +473,7 @@ def model_reset():
     """Delete the trained RL model (forces fresh start)."""
     try:
         from cyberpet.config import Config
-        config = Config()
+        config = Config.load()
         model_dir = config.rl.get("model_path", "/var/lib/cyberpet/models/")
         model_file = os.path.join(model_dir, "cyberpet_ppo.zip")
 
