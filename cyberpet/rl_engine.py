@@ -28,6 +28,16 @@ _MODEL_FILENAME = "cyberpet_ppo.zip"
 _WARMUP_ACTIONS = {0, 1}             # ALLOW, LOG_WARN
 _WARMUP_ACTIONS_WITH_THREATS = {0, 1, 3}  # + QUARANTINE_FILE
 
+# Learning-Safe Mode: restrict destructive actions until this many steps
+_DEFAULT_LEARNING_SAFE_STEPS = 500
+_LEARNING_SAFE_ACTIONS = {0, 1, 5, 6}  # ALLOW, LOG_WARN, RESTORE, SCAN
+_DESTRUCTIVE_FALLBACK = {              # destructive → safe fallback
+    2: 1,  # BLOCK_PROCESS → LOG_WARN
+    3: 1,  # QUARANTINE_FILE → LOG_WARN
+    4: 0,  # NETWORK_ISOLATE → ALLOW
+    7: 0,  # ESCALATE_LOCKDOWN → ALLOW
+}
+
 
 class RLEngine:
     """PPO-based RL engine for CyberPet.
@@ -65,6 +75,7 @@ class RLEngine:
             self._warmup_with_priors = rl_cfg.get("warmup_steps_with_priors", 50)
             self._warmup_deep = rl_cfg.get("warmup_steps_deep_priors", 25)
             self._deep_threshold = rl_cfg.get("deep_prior_threshold", 20)
+            self._learning_safe_steps = rl_cfg.get("learning_safe_steps", _DEFAULT_LEARNING_SAFE_STEPS)
         else:
             self._model_dir = getattr(rl_cfg, "model_path", "/var/lib/cyberpet/models/")
             self._checkpoint_interval = getattr(rl_cfg, "checkpoint_interval_steps", 3600)
@@ -72,6 +83,7 @@ class RLEngine:
             self._warmup_with_priors = getattr(rl_cfg, "warmup_steps_with_priors", 50)
             self._warmup_deep = getattr(rl_cfg, "warmup_steps_deep_priors", 25)
             self._deep_threshold = getattr(rl_cfg, "deep_prior_threshold", 20)
+            self._learning_safe_steps = getattr(rl_cfg, "learning_safe_steps", _DEFAULT_LEARNING_SAFE_STEPS)
 
         # ── Runtime state ──
         self._model: Any | None = None
@@ -189,6 +201,15 @@ class RLEngine:
             )
             if action not in allowed:
                 action = 0  # Fall back to ALLOW
+
+        # Learning-Safe Mode: restrict destructive actions until enough steps
+        elif self._total_steps < self._learning_safe_steps:
+            if action not in _LEARNING_SAFE_ACTIONS:
+                action = _DESTRUCTIVE_FALLBACK.get(action, 0)
+                logger.debug(
+                    f"Learning-safe: step {self._total_steps}/{self._learning_safe_steps}, "
+                    f"redirected to action {action}"
+                )
 
         # Step
         new_obs, reward, done, truncated, info = self._env.step(action)
