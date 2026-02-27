@@ -321,7 +321,7 @@ tests/
 | `yara-python`   | Recommended | YARA scanning              |
 | `python-magic`  | Recommended | File type detection        |
 | `pyelftools`    | Recommended | ELF binary analysis        |
-| `stable-baselines3` | V3     | PPO reinforcement learning |
+| `stable-baselines3` | V3      | PPO reinforcement learning |
 | `torch` (CPU)   | V3          | Neural network backend     |
 | `gymnasium`     | V3          | RL environment framework   |
 | `numpy`         | V3          | Numerical computation      |

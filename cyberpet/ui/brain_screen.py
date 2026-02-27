@@ -21,6 +21,14 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Static
 
+# Lazily import intelligence helper to avoid circular import
+_get_intelligence = None
+def _intel(steps, reward):
+    global _get_intelligence
+    if _get_intelligence is None:
+        from cyberpet.ui.pet import _get_intelligence
+    return _get_intelligence(steps, reward)
+
 # ── Constants ──────────────────────────────────────────────────────
 ACTION_LABELS = [
     "ALLOW", "LOG_WARN", "BLOCK_PROCESS", "QUARANTINE_FILE",
@@ -230,6 +238,23 @@ class BrainStatusWidget(Static):
 
     def render(self) -> str:
         lines = ["┌─── Brain Status ──────────────────────────────────────┐"]
+
+        # Intelligence level
+        try:
+            intel = _intel(self._total_steps, self._avg_reward)
+            level_str = f"{intel['emoji']} {intel['level']} — {intel['desc']}"
+            lines.append(f"│  {level_str:<51}│")
+            iq = intel['iq']
+            iq_bar_len = int(iq / 100 * 30)
+            iq_bar = '█' * iq_bar_len + '░' * (30 - iq_bar_len)
+            lines.append(f"│  IQ  {iq_bar} {iq:>3}/100    │")
+            if intel['next_milestone']:
+                eta = f"→ {intel['next_milestone']} in ~{intel['eta']} ({intel['steps_to_next']} steps)"
+                lines.append(f"│  {eta:<51}│")
+        except Exception:
+            pass
+
+        lines.append("│                                                       │")
 
         # State with color indicator
         state_display = self._rl_state

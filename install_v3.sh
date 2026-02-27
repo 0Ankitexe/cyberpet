@@ -72,14 +72,11 @@ step "Installing V3 Python dependencies (RL brain)"
     /opt/cyberpet/venv/bin/pip install -q "torch>=2.0.0,<3.0.0" || warn "PyTorch installation failed — RL brain will be disabled"
 }
 
-# Install numpy first — it is a build-time dep for SB3 and gymnasium
-# --prefer-binary: use pre-compiled wheel, avoid building from source (needs g++)
-/opt/cyberpet/venv/bin/pip install -q --prefer-binary "numpy>=1.21.0,<2.0.0" || warn "numpy install failed"
-
-# Install RL dependencies
-# Note: stable-baselines3 WITHOUT [extra] — the extras pull pygame which
-# requires a C compiler and is not needed for CyberPet's RL brain
+# Install RL dependencies in one command so pip's resolver handles all conflicts
+# --prefer-binary: use pre-compiled wheels, avoid building from source
 /opt/cyberpet/venv/bin/pip install -q --prefer-binary \
+    "numpy" \
+    "pandas" \
     "stable-baselines3>=2.0.0,<3.0.0" \
     "gymnasium>=0.26.0,<1.0.0" \
     "shimmy>=1.0.0,<2.0.0" \

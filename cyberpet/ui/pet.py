@@ -260,6 +260,75 @@ class EventLogWidget(VerticalScroll):
         self.scroll_end(animate=False)
 
 
+# ── Intelligence Level System ─────────────────────────────────────
+# Maps steps + reward into a human-friendly level and score.
+
+_INTELLIGENCE_LEVELS = [
+    # (min_steps, min_reward, name, emoji, description)
+    (0,      -999, "Newborn",  "🥒", "Just hatched, exploring randomly"),
+    (50,     -1.0, "Curious",  "🐣", "Starting to notice patterns"),
+    (200,     0.0, "Learning", "🧠", "Making connections, still mistakes"),
+    (500,     1.5, "Smart",    "⚡", "Solid decisions, rare false positives"),
+    (2000,    3.0, "Expert",   "🎓", "Battle-hardened, highly accurate"),
+]
+
+_MILESTONES = [
+    (50,   "Curious"),
+    (200,  "Learning"),
+    (500,  "Smart"),
+    (2000, "Expert"),
+]
+
+
+def _get_intelligence(steps: int, avg_reward: float) -> dict:
+    """Calculate intelligence level, score, and ETA to next milestone."""
+    # Find current level
+    level_name = "Newborn"
+    level_emoji = "🥒"
+    level_desc = "Just hatched, exploring randomly"
+    for min_steps, min_reward, name, emoji, desc in _INTELLIGENCE_LEVELS:
+        if steps >= min_steps and avg_reward >= min_reward:
+            level_name = name
+            level_emoji = emoji
+            level_desc = desc
+
+    # Calculate IQ-like score (0-100 scale)
+    # Steps contribute 60%, reward contributes 40%
+    step_score = min(60, (steps / 2000) * 60)
+    reward_score = min(40, max(0, (avg_reward + 5) / 10) * 40)
+    iq = int(step_score + reward_score)
+
+    # Next milestone
+    next_milestone = None
+    steps_to_next = 0
+    for milestone_steps, milestone_name in _MILESTONES:
+        if steps < milestone_steps:
+            next_milestone = milestone_name
+            steps_to_next = milestone_steps - steps
+            break
+
+    # ETA (assuming 30s per step default)
+    eta_str = ""
+    if steps_to_next > 0:
+        eta_seconds = steps_to_next * 30
+        if eta_seconds < 3600:
+            eta_str = f"{eta_seconds // 60}m"
+        elif eta_seconds < 86400:
+            eta_str = f"{eta_seconds // 3600}h {(eta_seconds % 3600) // 60}m"
+        else:
+            eta_str = f"{eta_seconds // 86400}d {(eta_seconds % 86400) // 3600}h"
+
+    return {
+        "level": level_name,
+        "emoji": level_emoji,
+        "desc": level_desc,
+        "iq": iq,
+        "next_milestone": next_milestone,
+        "steps_to_next": steps_to_next,
+        "eta": eta_str,
+    }
+
+
 class BrainStatsWidget(Static):
     """V3: Widget displaying RL brain statistics and action distribution."""
 
@@ -285,12 +354,29 @@ class BrainStatsWidget(Static):
 
     def render(self) -> str:
         steps_fmt = f"{self.rl_steps:,}"
+
+        # Intelligence level
+        intel = _get_intelligence(self.rl_steps, self.rl_reward)
+        level_line = f"{intel['emoji']} {intel['level']}"
+        iq_bar_len = int(intel['iq'] / 100 * 14)
+        iq_bar = "█" * iq_bar_len + "░" * (14 - iq_bar_len)
+
         lines = [
             "┌─── Brain ──────────────┐",
+            f"│ {level_line:<23}│",
+            f"│ IQ {iq_bar} {intel['iq']:>3} │",
+        ]
+
+        # ETA to next milestone
+        if intel['next_milestone']:
+            eta = f"→ {intel['next_milestone']} in {intel['eta']}"
+            lines.append(f"│ {eta:<23}│")
+
+        lines.extend([
             f"│ State  {self.rl_state:<16}│",
             f"│ Steps  {steps_fmt:<16}│",
             f"│ Reward {self.rl_reward:>+7.2f}{'':<9}│",
-        ]
+        ])
 
         # Warmup progress bar
         if self.rl_state == "WARMUP":
