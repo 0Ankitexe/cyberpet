@@ -132,8 +132,9 @@ class TestRLPriorKnowledgePopulated(unittest.TestCase):
     def test_action_bias_favors_quarantine(self) -> None:
         self.prior.load()
         bias = self.prior.get_action_bias()
-        # 3 confirmed threats > 0 FPs in scan history → bias quarantine up
-        self.assertGreater(bias[3], 1.0)  # QUARANTINE_FILE biased up
+        # 8 FPs > 3 threats → FP-heavy path: reduce quarantine, boost allow
+        self.assertLess(bias[3], 1.0)    # QUARANTINE_FILE biased down
+        self.assertGreater(bias[0], 1.0)  # ALLOW biased up
 
     def test_safe_file_penalty_set(self) -> None:
         self.prior.load()

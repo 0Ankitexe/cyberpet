@@ -18,6 +18,8 @@ class _MockPetState:
     """Lightweight PetState stand-in."""
     files_quarantined = 2
     last_scan_threats_found = 1
+    last_scan_type = ""
+    last_scan_time = 0.0
 
 
 class TestStateVectorShape(unittest.TestCase):

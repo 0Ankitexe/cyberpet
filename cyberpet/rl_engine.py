@@ -274,17 +274,7 @@ class RLEngine:
         if self._env is not None:
             env = self._env
         else:
-            from cyberpet.rl_env import CyberPetEnv
-            from cyberpet.state_collector import STATE_DIM
-            import gymnasium as gym
-            from gymnasium import spaces
-            import numpy as np
-
-            # Minimal dummy env for model creation
-            env = gym.make(
-                "CartPole-v1"  # Placeholder — will be replaced by set_env()
-            )
-            # We need to create with proper spaces, use a wrapper
+            # Use the dummy env for initial model creation
             env = _DummyEnv()
 
         model = PPO(
@@ -310,31 +300,32 @@ class RLEngine:
         return model
 
 
-class _DummyEnv:
-    """Minimal environment stub for PPO model creation."""
+try:
+    import gymnasium as _gymnasium
+    import numpy as _np
+    from cyberpet.state_collector import STATE_DIM as _STATE_DIM
 
-    def __init__(self) -> None:
-        import numpy as np
-        from gymnasium import spaces
-        from cyberpet.state_collector import STATE_DIM
+    class _DummyEnv(_gymnasium.Env):
+        """Minimal gymnasium environment stub for PPO model creation."""
 
-        self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32,
-        )
-        self.action_space = spaces.Discrete(8)
+        def __init__(self) -> None:
+            super().__init__()
+            self.observation_space = _gymnasium.spaces.Box(
+                low=0.0, high=1.0, shape=(_STATE_DIM,), dtype=_np.float32,
+            )
+            self.action_space = _gymnasium.spaces.Discrete(8)
 
-    def reset(self, **kwargs):
-        import numpy as np
-        from cyberpet.state_collector import STATE_DIM
-        return np.zeros(STATE_DIM, dtype=np.float32), {}
+        def reset(self, **kwargs):
+            return _np.zeros(_STATE_DIM, dtype=_np.float32), {}
 
-    def step(self, action):
-        import numpy as np
-        from cyberpet.state_collector import STATE_DIM
-        return np.zeros(STATE_DIM, dtype=np.float32), 0.0, False, False, {}
+        def step(self, action):
+            return _np.zeros(_STATE_DIM, dtype=_np.float32), 0.0, False, False, {}
 
-    def render(self):
-        pass
+        def render(self):
+            pass
 
-    def close(self):
-        pass
+        def close(self):
+            pass
+
+except ImportError:
+    _DummyEnv = None  # type: ignore[assignment,misc]
