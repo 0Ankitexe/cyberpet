@@ -56,21 +56,28 @@ info "System dependencies checked"
 # ── Step 3: Python dependencies ──────────────────────────────────
 step "Installing V3 Python dependencies (RL brain)"
 
+# Upgrade pip/wheel/setuptools first — required for pyproject.toml packages
+/opt/cyberpet/venv/bin/pip install -q --upgrade pip wheel setuptools
+
 # Install PyTorch CPU-only first (to avoid pulling CUDA)
-/opt/cyberpet/venv/bin/pip install --quiet \
+/opt/cyberpet/venv/bin/pip install -q \
     torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu \
     2>/dev/null || {
     warn "PyTorch CPU install failed, trying default index"
-    /opt/cyberpet/venv/bin/pip install --quiet "torch>=2.0.0,<3.0.0" 2>/dev/null || warn "PyTorch installation failed — RL brain will be disabled"
+    /opt/cyberpet/venv/bin/pip install -q "torch>=2.0.0,<3.0.0" || warn "PyTorch installation failed — RL brain will be disabled"
 }
 
+# Install numpy first — it is a build-time dep for SB3 and gymnasium
+/opt/cyberpet/venv/bin/pip install -q "numpy>=1.21.0,<2.0.0" || warn "numpy install failed"
+
 # Install RL dependencies
-/opt/cyberpet/venv/bin/pip install --quiet \
-    "stable-baselines3[extra]==2.3.2" \
-    "gymnasium==0.29.1" \
-    "numpy==1.26.4" \
-    "shimmy==1.3.0" \
-    2>/dev/null || warn "Some RL packages failed to install"
+# Note: stable-baselines3 WITHOUT [extra] — the extras pull pygame which
+# requires a C compiler and is not needed for CyberPet's RL brain
+/opt/cyberpet/venv/bin/pip install -q \
+    "stable-baselines3>=2.0.0,<3.0.0" \
+    "gymnasium>=0.26.0,<1.0.0" \
+    "shimmy>=1.0.0,<2.0.0" \
+    || warn "Some RL packages failed to install"
 
 info "Python dependencies installed (stable-baselines3, gymnasium, numpy, shimmy, torch)"
 
