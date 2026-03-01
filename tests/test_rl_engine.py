@@ -30,7 +30,7 @@ class _FakeScanHistory:
 
 
 class _FakeConfig:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, allow_network_actions=True):
         self.rl = {
             "enabled": True,
             "model_path": model_dir,
@@ -40,7 +40,31 @@ class _FakeConfig:
             "warmup_steps_with_priors": 50,
             "warmup_steps_deep_priors": 25,
             "deep_prior_threshold": 20,
+            "allow_network_actions": allow_network_actions,
         }
+
+
+class _PredictModel:
+    def __init__(self, action: int):
+        self._action = action
+
+    def predict(self, _obs, deterministic=False):
+        return self._action, None
+
+    def learn(self, total_timesteps=0, reset_num_timesteps=False):
+        return self
+
+
+class _StepEnv:
+    def __init__(self):
+        self.last_action = None
+
+    def reset(self):
+        return [0.0] * 44, {}
+
+    def step(self, action):
+        self.last_action = action
+        return [0.0] * 44, 0.0, False, False, {"confidence": 1.0}
 
 
 class TestRLEngineInit(unittest.TestCase):
@@ -266,6 +290,56 @@ class TestRLEngineFPEvents(unittest.TestCase):
             engine.initialize()
 
             self.assertEqual(engine.avg_reward, 0.0)
+
+
+class TestRLEngineNetworkActionRemap(unittest.TestCase):
+    """Ensure 4/7 are remapped when network actions are disabled."""
+
+    def test_network_isolate_action_is_remapped_to_allow(self) -> None:
+        from cyberpet.rl_engine import RLEngine
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bus = EventBus()
+            fp = _FakeFPMemory()
+            hist = _FakeScanHistory()
+            config = _FakeConfig(tmpdir, allow_network_actions=False)
+
+            engine = RLEngine(config, bus, fp, hist)
+            engine._initialized = True
+            engine._warmup_steps = 0
+            engine._total_steps = engine._learning_safe_steps + 1
+            engine._model = _PredictModel(4)
+            env = _StepEnv()
+            engine._env = env
+
+            step_info = engine.run_step()
+
+            self.assertEqual(env.last_action, 0)
+            self.assertEqual(step_info.get("action"), 0)
+            self.assertEqual(step_info.get("action_name"), "ALLOW")
+
+    def test_escalate_lockdown_action_is_remapped_to_allow(self) -> None:
+        from cyberpet.rl_engine import RLEngine
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bus = EventBus()
+            fp = _FakeFPMemory()
+            hist = _FakeScanHistory()
+            config = _FakeConfig(tmpdir, allow_network_actions=False)
+
+            engine = RLEngine(config, bus, fp, hist)
+            engine._initialized = True
+            engine._warmup_steps = 0
+            engine._total_steps = engine._learning_safe_steps + 1
+            engine._model = _PredictModel(7)
+            env = _StepEnv()
+            engine._env = env
+
+            step_info = engine.run_step()
+
+            self.assertEqual(env.last_action, 0)
+            self.assertEqual(step_info.get("action"), 0)
+            self.assertEqual(step_info.get("action_name"), "ALLOW")
 
 
 if __name__ == "__main__":

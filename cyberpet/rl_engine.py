@@ -81,6 +81,7 @@ class RLEngine:
             self._warmup_deep = rl_cfg.get("warmup_steps_deep_priors", 25)
             self._deep_threshold = rl_cfg.get("deep_prior_threshold", 20)
             self._learning_safe_steps = rl_cfg.get("learning_safe_steps", _DEFAULT_LEARNING_SAFE_STEPS)
+            self._allow_network_actions = bool(rl_cfg.get("allow_network_actions", True))
         else:
             self._model_dir = getattr(rl_cfg, "model_path", "/var/lib/cyberpet/models/")
             self._checkpoint_interval = getattr(rl_cfg, "checkpoint_interval_steps", 240)
@@ -89,6 +90,7 @@ class RLEngine:
             self._warmup_deep = getattr(rl_cfg, "warmup_steps_deep_priors", 25)
             self._deep_threshold = getattr(rl_cfg, "deep_prior_threshold", 20)
             self._learning_safe_steps = getattr(rl_cfg, "learning_safe_steps", _DEFAULT_LEARNING_SAFE_STEPS)
+            self._allow_network_actions = bool(getattr(rl_cfg, "allow_network_actions", True))
 
         # ── Runtime state ──
         self._model: Any | None = None
@@ -260,6 +262,14 @@ class RLEngine:
                     f"Learning-safe: step {self._total_steps}/{self._learning_safe_steps}, "
                     f"redirected to action {action}"
                 )
+
+        # Config-level guard: when disabled, never execute network actions.
+        if not self._allow_network_actions and action in (4, 7):
+            redirected = _DESTRUCTIVE_FALLBACK.get(action, 0)
+            logger.debug(
+                f"Network actions disabled: redirected action {action} -> {redirected}"
+            )
+            action = redirected
 
         # Step
         new_obs, reward, done, truncated, info = self._env.step(action)
