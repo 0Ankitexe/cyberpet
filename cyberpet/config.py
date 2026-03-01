@@ -78,6 +78,18 @@ _FALLBACK_CONFIG: dict[str, Any] = {
         "db_path": "/var/lib/cyberpet/hashes.db",
         "seed_file": "/etc/cyberpet/seed_hashes.csv",
     },
+    "rl": {
+        "enabled": True,
+        "model_path": "/var/lib/cyberpet/models/",
+        "decision_interval_seconds": 30,
+        "checkpoint_interval_steps": 3600,
+        "warmup_steps_no_priors": 100,
+        "warmup_steps_with_priors": 50,
+        "warmup_steps_deep_priors": 25,
+        "deep_prior_threshold": 20,
+        "learning_safe_steps": 500,
+        "allow_network_actions": False,
+    },
 }
 
 

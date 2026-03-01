@@ -447,7 +447,7 @@ class CyberPetDaemon:
                 # Action executor
                 vault = getattr(self._scan_scheduler, 'quarantine', None)
                 action_executor = ActionExecutor(
-                    self.event_bus, vault, fp_memory, prior, self.pet_state,
+                    self.event_bus, vault, fp_memory, prior, self.pet_state, config=self.config,
                 )
 
                 # Gymnasium environment

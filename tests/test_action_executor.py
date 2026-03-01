@@ -33,7 +33,7 @@ class _FakePrior:
 class TestActionExecutorBasics(unittest.TestCase):
     """Verify basic action execution."""
 
-    def _make_executor(self, safe_hashes=None, safe_set=None):
+    def _make_executor(self, safe_hashes=None, safe_set=None, config=None):
         from cyberpet.action_executor import ActionExecutor
 
         bus = EventBus()
@@ -44,7 +44,7 @@ class TestActionExecutorBasics(unittest.TestCase):
         from cyberpet.state import PetState
         pet = PetState()
 
-        return ActionExecutor(bus, vault, fp, prior, pet)
+        return ActionExecutor(bus, vault, fp, prior, pet, config=config)
 
     def test_allow_returns_success(self) -> None:
         ae = self._make_executor()
@@ -79,7 +79,7 @@ class TestActionExecutorBasics(unittest.TestCase):
 class TestActionExecutorFPProtection(unittest.TestCase):
     """Verify false positive protection on blocking actions."""
 
-    def _make_executor(self, safe_hashes=None, safe_set=None):
+    def _make_executor(self, safe_hashes=None, safe_set=None, config=None):
         from cyberpet.action_executor import ActionExecutor
 
         bus = EventBus()
@@ -90,7 +90,7 @@ class TestActionExecutorFPProtection(unittest.TestCase):
         from cyberpet.state import PetState
         pet = PetState()
 
-        return ActionExecutor(bus, vault, fp, prior, pet)
+        return ActionExecutor(bus, vault, fp, prior, pet, config=config)
 
     def test_quarantine_fp_file_aborts(self) -> None:
         ae = self._make_executor(safe_hashes={"/tmp/safe_file"})
@@ -109,7 +109,7 @@ class TestActionExecutorFPProtection(unittest.TestCase):
 class TestActionExecutorUS2FPEnhancements(unittest.TestCase):
     """T020: Test FP memory abort, safe-set abort, and quarantine confirmation."""
 
-    def _make_executor(self, safe_hashes=None, safe_set=None):
+    def _make_executor(self, safe_hashes=None, safe_set=None, config=None):
         from cyberpet.action_executor import ActionExecutor
 
         bus = EventBus()
@@ -122,7 +122,7 @@ class TestActionExecutorUS2FPEnhancements(unittest.TestCase):
         from cyberpet.state import PetState
         pet = PetState()
 
-        return ActionExecutor(bus, vault, self._fp, prior, pet)
+        return ActionExecutor(bus, vault, self._fp, prior, pet, config=config)
 
     def test_quarantine_fp_in_memory_aborts(self) -> None:
         ae = self._make_executor(safe_hashes={"/tmp/known_safe"})
@@ -162,7 +162,7 @@ class TestActionExecutorUS2FPEnhancements(unittest.TestCase):
 class TestActionExecutorUS4FullActions(unittest.TestCase):
     """T028: Test all 8 actions return valid ActionResult with details."""
 
-    def _make_executor(self):
+    def _make_executor(self, config=None):
         from cyberpet.action_executor import ActionExecutor
 
         bus = EventBus()
@@ -173,7 +173,7 @@ class TestActionExecutorUS4FullActions(unittest.TestCase):
         from cyberpet.state import PetState
         pet = PetState()
 
-        return ActionExecutor(bus, vault, fp, prior, pet)
+        return ActionExecutor(bus, vault, fp, prior, pet, config=config)
 
     def test_network_isolate_confirms_threat(self) -> None:
         ae = self._make_executor()
@@ -234,6 +234,52 @@ class TestActionExecutorUS4FullActions(unittest.TestCase):
         result = ae.execute(0)
         self.assertFalse(result.confirmed_threat)
         self.assertFalse(result.false_positive)
+
+    @patch("cyberpet.action_executor.subprocess.run")
+    def test_escalate_lockdown_adds_rule_once(self, run_mock) -> None:
+        ae = self._make_executor()
+        # -C exists? no -> add once
+        run_mock.side_effect = [
+            MagicMock(returncode=1),  # iptables -C
+            MagicMock(returncode=0),  # iptables -A
+        ]
+        result = ae.execute(7)
+        self.assertTrue(result.success)
+        self.assertEqual(run_mock.call_count, 2)
+
+    @patch("cyberpet.action_executor.subprocess.run")
+    def test_restore_removes_lockdown_rules(self, run_mock) -> None:
+        ae = self._make_executor()
+        ae._current_target = {"filepath": "/tmp/quarantined"}
+        # First -C true -> one delete, then -C false stop loop
+        run_mock.side_effect = [
+            MagicMock(returncode=0),  # -C port drop exists
+            MagicMock(returncode=0),  # -D delete
+            MagicMock(returncode=1),  # -C no more
+        ]
+        result = ae.execute(5)
+        self.assertTrue(result.success)
+        self.assertGreaterEqual(run_mock.call_count, 3)
+
+    @patch("cyberpet.action_executor.subprocess.run")
+    def test_network_isolate_is_noop_when_network_actions_disabled(self, run_mock) -> None:
+        cfg = type("Cfg", (), {"rl": {"allow_network_actions": False}})()
+        ae = self._make_executor(config=cfg)
+        ae._current_target = {"pid": "12345", "uid": "1000"}
+        result = ae.execute(4)
+        self.assertTrue(result.success)
+        self.assertEqual(result.details, "Network actions disabled by config")
+        run_mock.assert_not_called()
+
+    @patch("cyberpet.action_executor.subprocess.run")
+    def test_escalate_lockdown_is_noop_when_network_actions_disabled(self, run_mock) -> None:
+        cfg = type("Cfg", (), {"rl": {"allow_network_actions": False}})()
+        ae = self._make_executor(config=cfg)
+        ae._current_target = {"pid": "12345"}
+        result = ae.execute(7)
+        self.assertTrue(result.success)
+        self.assertEqual(result.details, "Network actions disabled by config")
+        run_mock.assert_not_called()
 
 
 if __name__ == "__main__":

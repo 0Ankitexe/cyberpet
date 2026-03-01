@@ -15,6 +15,7 @@ import logging
 import os
 import time
 import signal
+import subprocess
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -84,12 +85,29 @@ class ActionExecutor:
         fp_memory: Any,
         prior: Any,
         pet_state: Any,
+        config: Any | None = None,
     ) -> None:
         self._bus = event_bus
         self._vault = quarantine_vault
         self._fp = fp_memory
         self._prior = prior
         self._pet = pet_state
+        self._allow_network_actions = True
+        if config is not None:
+            try:
+                rl_cfg = getattr(config, "rl", {})
+                if hasattr(rl_cfg, "get"):
+                    self._allow_network_actions = bool(
+                        rl_cfg.get("allow_network_actions", False)
+                    )
+                elif isinstance(rl_cfg, dict):
+                    self._allow_network_actions = bool(
+                        rl_cfg.get("allow_network_actions", False)
+                    )
+                else:
+                    self._allow_network_actions = False
+            except Exception:
+                self._allow_network_actions = False
 
         # Safe set from prior knowledge (sha256, filepath)
         try:
@@ -186,6 +204,55 @@ class ActionExecutor:
             loop.create_task(self._bus.publish(event))
         except RuntimeError:
             logger.debug(f"No event loop to publish {event.type}")
+
+    @staticmethod
+    def _iptables_rule_exists(rule_args: list[str]) -> bool:
+        """Check whether an iptables OUTPUT rule already exists."""
+        try:
+            res = subprocess.run(
+                ["iptables", "-C", *rule_args],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    @classmethod
+    def _iptables_add_once(cls, rule_args: list[str]) -> bool:
+        """Add an iptables rule once; no-op if already present."""
+        if cls._iptables_rule_exists(rule_args):
+            return False
+        try:
+            subprocess.run(
+                ["iptables", "-A", *rule_args],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _iptables_delete_all(cls, rule_args: list[str]) -> int:
+        """Delete all matching iptables rules and return delete count."""
+        removed = 0
+        while cls._iptables_rule_exists(rule_args):
+            try:
+                res = subprocess.run(
+                    ["iptables", "-D", *rule_args],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                if res.returncode != 0:
+                    break
+                removed += 1
+            except Exception:
+                break
+        return removed
 
     # ── Action implementations ─────────────────────────────────────────
 
@@ -295,19 +362,23 @@ class ActionExecutor:
         if fp_check:
             return fp_check
 
+        if not self._allow_network_actions:
+            return ActionResult(
+                action=action,
+                success=True,
+                details="Network actions disabled by config",
+            )
+
         pid = self._current_target.get("pid", "")
         logger.warning(f"RL NETWORK_ISOLATE: restricting outbound for PID {pid}")
 
         # Attempt iptables-based isolation for the flagged PID
         if pid:
             try:
-                import subprocess
                 uid = self._current_target.get("uid", "")
                 if uid:
-                    subprocess.run(
-                        ["iptables", "-A", "OUTPUT", "-m", "owner",
-                         "--uid-owner", str(uid), "-j", "DROP"],
-                        capture_output=True, timeout=5, check=False,
+                    self._iptables_add_once(
+                        ["OUTPUT", "-m", "owner", "--uid-owner", str(uid), "-j", "DROP"]
                     )
             except Exception as exc:
                 logger.warning(f"iptables isolation failed: {exc}")
@@ -338,6 +409,14 @@ class ActionExecutor:
                 loop.create_task(self._vault.restore_file(filepath))
             except (RuntimeError, AttributeError) as exc:
                 logger.debug(f"Restore async failed: {exc}")
+
+        # De-escalation: remove lockdown rules introduced by RL actions.
+        uid = self._current_target.get("uid", "")
+        if uid:
+            self._iptables_delete_all(
+                ["OUTPUT", "-m", "owner", "--uid-owner", str(uid), "-j", "DROP"]
+            )
+        self._iptables_delete_all(["OUTPUT", "-p", "tcp", "--dport", "1:1023", "-j", "DROP"])
 
         # Publish LOCKDOWN_DEACTIVATED event (restore = de-escalation)
         self._publish_event(Event(
@@ -410,6 +489,13 @@ class ActionExecutor:
         if fp_check:
             return fp_check
 
+        if not self._allow_network_actions:
+            return ActionResult(
+                action=action,
+                success=True,
+                details="Network actions disabled by config",
+            )
+
         logger.warning("RL ESCALATE_LOCKDOWN activated")
 
         # Kill suspicious processes if PIDs are known
@@ -422,12 +508,7 @@ class ActionExecutor:
 
         # Block non-essential outbound network
         try:
-            import subprocess
-            subprocess.run(
-                ["iptables", "-A", "OUTPUT", "-p", "tcp",
-                 "--dport", "1:1023", "-j", "DROP"],
-                capture_output=True, timeout=5, check=False,
-            )
+            self._iptables_add_once(["OUTPUT", "-p", "tcp", "--dport", "1:1023", "-j", "DROP"])
         except Exception as exc:
             logger.warning(f"Lockdown iptables failed: {exc}")
 

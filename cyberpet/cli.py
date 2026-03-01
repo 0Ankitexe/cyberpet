@@ -557,6 +557,48 @@ def model_info():
 _RL_CONTROL_FILE = "/var/run/cyberpet_rl_control"
 
 
+def _run_iptables(args: list[str]) -> subprocess.CompletedProcess | None:
+    """Run iptables with safe defaults; return None on execution failure."""
+    try:
+        return subprocess.run(
+            ["iptables", *args],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+
+
+def _delete_iptables_rule_all(rule_args: list[str]) -> int:
+    """Delete all matching iptables rules and return count."""
+    removed = 0
+    while True:
+        chk = _run_iptables(["-C", *rule_args])
+        if chk is None or chk.returncode != 0:
+            break
+        rem = _run_iptables(["-D", *rule_args])
+        if rem is None or rem.returncode != 0:
+            break
+        removed += 1
+    return removed
+
+
+def _clear_rl_firewall_rules() -> int:
+    """Remove RL lockdown/isolation iptables rules inserted by CyberPet."""
+    removed = 0
+    removed += _delete_iptables_rule_all(
+        ["OUTPUT", "-p", "tcp", "--dport", "1:1023", "-j", "DROP"]
+    )
+
+    sudo_uid = os.environ.get("SUDO_UID", "")
+    if sudo_uid.isdigit():
+        removed += _delete_iptables_rule_all(
+            ["OUTPUT", "-m", "owner", "--uid-owner", sudo_uid, "-j", "DROP"]
+        )
+    return removed
+
+
 @model.command("start")
 def model_start():
     """Start RL brain training (the daemon must be running)."""
@@ -600,7 +642,10 @@ def model_stop():
             os.chmod(_RL_CONTROL_FILE, 0o666)
         except OSError:
             pass
+        removed = _clear_rl_firewall_rules()
         click.echo("⏸  RL training PAUSED")
+        if removed:
+            click.echo(f"  Removed {removed} RL firewall rule(s)")
         click.echo()
         click.echo("  The model and progress are preserved.")
         click.echo("  Brain UI will show state: PAUSED")

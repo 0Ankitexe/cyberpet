@@ -59,3 +59,4 @@ warmup_steps_with_priors = 50
 warmup_steps_deep_priors = 25
 deep_prior_threshold = 20
 learning_safe_steps = 500
+allow_network_actions = false

@@ -60,7 +60,28 @@ class CLIRuntimeTests(unittest.TestCase):
 
         execv.assert_not_called()
 
+    def test_delete_iptables_rule_all_removes_until_absent(self) -> None:
+        with patch.object(cli, "_run_iptables") as run_mock:
+            # -C hit, -D delete, -C miss
+            run_mock.side_effect = [
+                type("R", (), {"returncode": 0})(),
+                type("R", (), {"returncode": 0})(),
+                type("R", (), {"returncode": 1})(),
+            ]
+            removed = cli._delete_iptables_rule_all(
+                ["OUTPUT", "-p", "tcp", "--dport", "1:1023", "-j", "DROP"]
+            )
+        self.assertEqual(removed, 1)
+
+    def test_clear_rl_firewall_rules_includes_sudo_uid_rule(self) -> None:
+        with (
+            patch.dict(os.environ, {"SUDO_UID": "1000"}, clear=False),
+            patch.object(cli, "_delete_iptables_rule_all") as del_mock,
+        ):
+            del_mock.side_effect = [2, 1]
+            removed = cli._clear_rl_firewall_rules()
+        self.assertEqual(removed, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
-
