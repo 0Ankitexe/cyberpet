@@ -90,6 +90,12 @@ cyberpet scan full
 # Check RL brain status (V3)
 cyberpet model status
 
+# Start RL training (V3)
+cyberpet model start
+
+# Pause RL training — progress preserved (V3)
+cyberpet model stop
+
 # View RL brain architecture (V3)
 cyberpet model info
 ```
@@ -104,7 +110,17 @@ source /etc/cyberpet/shell_hook.sh
 
 ---
 
-## 🎮 Interactive Scan UI
+## 🎮 TUI Keybindings
+
+| Key | Action                                    |
+| --- | ----------------------------------------- |
+| `Q` | Quit TUI (daemon keeps running)           |
+| `S` | Open scan menu / reconnect to active scan |
+| `B` | Open Brain screen (RL details)            |
+| `D` | Toggle dark/light mode                    |
+| `C` | Clear event log                           |
+
+## 🔍 Interactive Scan UI
 
 Press **`S`** in the pet TUI to open the scan menu:
 
@@ -119,7 +135,7 @@ Main TUI  →  [S]  →  Quick Scan / Full Scan
                           ✅ Mark Safe   — remember as false positive
 ```
 
-When you press ESC during a scan, it continues running in the background — the main TUI shows live progress. Press `S` again to jump back to the scan screen.
+Scans run in the daemon — press **Q** to quit the TUI and the scan keeps running. Reopen with `cyberpet pet` and press **S** to reconnect.
 
 ---
 
@@ -139,10 +155,15 @@ When you press ESC during a scan, it continues running in the background — the
 | `cyberpet quarantine restore <id>` | Restore a quarantined file                  |
 | `cyberpet quarantine delete <id>`  | Permanently delete a quarantined file       |
 | `cyberpet model status`            | Show RL brain status and FP analysis (V3)   |
+| `cyberpet model start`             | Start RL training — daemon begins learning (V3) |
+| `cyberpet model stop`              | Pause RL training — progress preserved (V3) |
 | `cyberpet model reset`             | Delete trained RL model (V3)                |
 | `cyberpet model info`              | Display PPO architecture details (V3)       |
 | `cyberpet fp list`                 | List false positive memory entries (V3)     |
 | `cyberpet fp clear`                | Clear all FP memory entries (V3)            |
+| `cyberpet autostart on`            | Start CyberPet automatically on boot        |
+| `cyberpet autostart off`           | Disable autostart on boot                   |
+| `cyberpet autostart status`        | Check if autostart is enabled               |
 
 ---
 
@@ -333,7 +354,7 @@ tests/
 
 ```bash
 # Run all tests
-/opt/cyberpet/venv/bin/python -m pytest tests/ -v
+sudo /opt/cyberpet/venv/bin/python -m pytest tests/ -v
 ```
 
 ---

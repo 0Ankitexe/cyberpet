@@ -36,6 +36,7 @@ whitelist = ["apt", "apt-get", "dpkg", "dnf", "yum", "rpm", "pip", "pip3", "syst
 
 [exec_monitor]
 enabled = true
+force_enable = false
 
 [yara]
 rules_dir = "/etc/cyberpet/rules/"
@@ -49,7 +50,7 @@ db_path = "/var/lib/cyberpet/hashes.db"
 seed_file = "/etc/cyberpet/seed_hashes.csv"
 
 [rl]
-enabled = false
+enabled = true
 model_path = "/var/lib/cyberpet/models/"
 decision_interval_seconds = 30
 checkpoint_interval_steps = 3600

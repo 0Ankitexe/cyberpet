@@ -148,8 +148,30 @@ class ExecMonitor:
             )
             return False
 
+        # Kernel compatibility gate: avoid invoking BPF compiler on kernels
+        # whose sched_process_exec tracepoint layout is missing `filename`.
+        if not self._kernel_supports_sched_exec_filename():
+            log_warn(
+                "Kernel tracepoint sched_process_exec is incompatible "
+                "(missing `filename` field) — exec monitor disabled",
+                module="exec_monitor",
+            )
+            return False
+
         if not self._start_with_tracepoint():
-            if not self._start_with_kprobe():
+            use_kprobe_fallback = bool(
+                self.config.get("use_kprobe_fallback", False)
+            ) if self.config is not None else False
+            if use_kprobe_fallback:
+                if not self._start_with_kprobe():
+                    self._bpf = None
+                    self._attach_mode = ""
+                    return False
+            else:
+                log_warn(
+                    "Tracepoint attach failed; kprobe fallback disabled by config",
+                    module="exec_monitor",
+                )
                 self._bpf = None
                 self._attach_mode = ""
                 return False
@@ -161,6 +183,19 @@ class ExecMonitor:
         log_info(f"eBPF exec monitor started ({self._attach_mode})", module="exec_monitor")
         return True
 
+    @staticmethod
+    def _kernel_supports_sched_exec_filename() -> bool:
+        """Check tracepoint schema without compiling BPF programs."""
+        format_path = "/sys/kernel/debug/tracing/events/sched/sched_process_exec/format"
+        try:
+            with open(format_path, "r", encoding="utf-8") as f:
+                fmt = f.read()
+            return "filename" in fmt
+        except OSError:
+            # Conservative default: if tracefs schema cannot be inspected,
+            # skip exec monitor to avoid hard daemon failures on mismatched kernels.
+            return False
+
     def _start_with_tracepoint(self) -> bool:
         """Attempt tracepoint mode (preferred)."""
         try:
@@ -168,7 +203,7 @@ class ExecMonitor:
             self._bpf["events"].open_perf_buffer(self._handle_event_raw)
             self._attach_mode = "tracepoint:sched_process_exec"
             return True
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             log_warn(
                 f"Tracepoint attach failed ({exc}); trying kprobe fallback",
                 module="exec_monitor",
@@ -186,13 +221,13 @@ class ExecMonitor:
                     self._bpf.attach_kprobe(event=event_name, fn_name="trace_execve")
                     self._attach_mode = f"kprobe:{event_name}"
                     break
-                except Exception as exc:
+                except (Exception, SystemExit) as exc:
                     attach_errors.append(f"{event_name}: {exc}")
             if not self._attach_mode:
                 raise RuntimeError("; ".join(attach_errors))
             self._bpf["events"].open_perf_buffer(self._handle_event_raw)
             return True
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             log_warn(
                 f"kprobe fallback failed — exec monitor disabled: {exc}",
                 module="exec_monitor",

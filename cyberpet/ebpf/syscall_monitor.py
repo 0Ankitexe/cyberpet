@@ -151,7 +151,7 @@ class SyscallAnomalyMonitor:
         try:
             self._bpf = BPF(text=_BPF_PROGRAM)
             self._bpf["syscall_events"].open_perf_buffer(self._handle_raw)
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             logger.warning(f"Failed to attach syscall monitor: {exc}")
             self._bpf = None
             return False

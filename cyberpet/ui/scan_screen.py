@@ -21,6 +21,7 @@ from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, ProgressBar, Static
 from textual.widgets import ListItem, ListView
 
+from cyberpet.scan_trigger import append_trigger_command
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -108,7 +109,11 @@ class ScanScreen(Screen):
         Binding("escape", "go_back", "Back", show=True),
     ]
 
-    def __init__(self, scan_type: str = "quick", reconnect_state: dict | None = None, **kwargs: Any) -> None:
+    def __init__(self, scan_type: str = "quick", reconnect_state: dict | None = None,
+                 monitoring: bool = False, monitor_start: float = 0.0,
+                 monitor_files: int = 0, monitor_recent_files: list[str] | None = None,
+                 monitor_paused: bool = False,
+                 **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.scan_type = scan_type
         self._scanning = False
@@ -125,9 +130,21 @@ class ScanScreen(Screen):
         self._threats: list[dict] = []
         self._scan_start: float = 0
         self._run_id: int = 0
-        self._recent_files: list[str] = []  # last N files scanned for display
-        self._max_filelog: int = 50  # max files to show in log
+        self._recent_files: list[str] = []
+        self._max_filelog: int = 50
         self._reconnect_state = reconnect_state
+        self._monitoring = monitoring
+        self._monitor_start = monitor_start
+        self._monitor_files = monitor_files
+        self._monitor_recent_files = list(monitor_recent_files or [])
+        self._monitor_paused = bool(monitor_paused)
+        self._awaiting_daemon_events: bool = False
+        self._first_daemon_event_at: float = 0.0
+        self._await_timeout_seconds: float = 5.0
+        self._restart_after_cancel_wait: bool = False
+        self._retrigger_interval_seconds: float = 8.0
+        self._last_retrigger_at: float = 0.0
+        self._retrigger_attempts: int = 0
 
     # ── Layout ───────────────────────────────────────────────────────────
 
@@ -146,6 +163,7 @@ class ScanScreen(Screen):
                 yield Static("Speed:   —", id="speed")
                 yield ProgressBar(total=100, show_eta=False, id="pbar")
                 yield Button("▶  START SCAN", id="start-btn", variant="success")
+                yield Button("⏸  PAUSE", id="pause-btn", variant="warning", disabled=True)
                 yield Button("■  STOP SCAN", id="cancel-btn", variant="error", disabled=True)
                 yield Button("←  BACK", id="back-btn", variant="default")
 
@@ -232,11 +250,40 @@ class ScanScreen(Screen):
             self._show_prev()
             return
 
+        # ── Monitoring mode (daemon scan already running) ──────────
+        if self._monitoring:
+            self._scanning = True
+            self._done = False
+            self._scan_start = self._monitor_start or time.time()
+            self._event_queue = asyncio.Queue()
+            files = self._monitor_files
+            elapsed = time.time() - self._scan_start if self._scan_start else 1.0
+            speed = files / max(elapsed, 0.1)
+            if self._monitor_paused:
+                self.query_one("#status", Static).update("Paused — daemon scan")
+            else:
+                self.query_one("#status", Static).update("Scanning — daemon running")
+            self.query_one("#files", Static).update(f"Files:   {files:,}")
+            self.query_one("#speed", Static).update(f"Speed:   ~{speed:.0f} files/sec")
+            if self._monitor_recent_files:
+                self._recent_files = self._monitor_recent_files[-self._max_filelog:]
+                display = "\n".join(
+                    _trunc(f, 55) for f in reversed(self._recent_files[-30:])
+                )
+                self.query_one("#filelog", Static).update(display)
+            self.query_one("#start-btn", Button).disabled = True
+            self.query_one("#start-btn", Button).label = "⏳ Scanning..."
+            self.query_one("#pause-btn", Button).disabled = False
+            if self._monitor_paused:
+                self.query_one("#pause-btn", Button).label = "▶  RESUME"
+            else:
+                self.query_one("#pause-btn", Button).label = "⏸  PAUSE"
+            self.query_one("#cancel-btn", Button).disabled = False
+            self.set_interval(0.15, self._poll_events, name="poll")
+            return
+
         # ── Fresh scan setup ────────────────────────────────────────
-        from cyberpet.events import EventBus
-
-        self._event_bus = EventBus()
-
+        # Scans run in the daemon — we only need history/quarantine for display
         try:
             from cyberpet.config import Config
             config = Config.load()
@@ -257,39 +304,15 @@ class ScanScreen(Screen):
 
         try:
             from cyberpet.quarantine import QuarantineVault
+            from cyberpet.events import EventBus
+            self._event_bus = EventBus()
             self._quarantine = QuarantineVault(event_bus=self._event_bus)
         except Exception:
             pass
 
-        hash_db = None
-        yara_engine = None
-        try:
-            from cyberpet.hash_db import HashDatabase
-            hash_db = HashDatabase()
-        except Exception:
-            pass
-        if config:
-            try:
-                from cyberpet.yara_engine import YaraEngine
-                yara_engine = YaraEngine(config)
-            except Exception:
-                pass
-
-        try:
-            from cyberpet.scanner import FileScanner
-            self._scanner = FileScanner(
-                config=config or Config.load(),
-                event_bus=self._event_bus,
-                hash_db=hash_db,
-                yara_engine=yara_engine,
-                fp_memory=self._fp_memory,
-            )
-            self.query_one("#status", Static).update(
-                "READY — press S or click ▶ START SCAN"
-            )
-        except Exception as exc:
-            self.query_one("#status", Static).update(f"ERROR: {exc}")
-            return
+        self.query_one("#status", Static).update(
+            "READY — press S or click ▶ START SCAN"
+        )
 
         self._show_prev()
 
@@ -317,42 +340,60 @@ class ScanScreen(Screen):
             self.action_do_start()
         elif btn == "cancel-btn":
             self.action_do_cancel()
+        elif btn == "pause-btn":
+            self.action_do_pause()
         elif btn == "back-btn":
             self.action_go_back()
 
     # ── Actions ──────────────────────────────────────────────────────────
 
     def action_do_start(self) -> None:
-        if self._scanning or self._scanner is None:
+        if self._scanning:
             return
-
-        from cyberpet.scanner import CancellationToken
 
         self._scanning = True
         self._done = False
         self._threats.clear()
         self._recent_files.clear()
         self._scan_start = time.time()
-        self._cancel_token = CancellationToken()
-
-        # Subscribe to events
-        self._event_queue = asyncio.Queue()
-        self._event_bus._subscribers.append(self._event_queue)
+        self._awaiting_daemon_events = True
+        self._first_daemon_event_at = 0.0
+        # Restarting immediately after stop/cancel can legitimately take longer
+        # because the daemon must unwind the previous scan first.
+        last_cancel_at = float(getattr(self.app, "_last_scan_cancel_at", 0.0) or 0.0)
+        restart_after_cancel = bool(
+            getattr(self.app, "_scan_cancel_requested", False)
+            or (last_cancel_at and (time.time() - last_cancel_at) < 60.0)
+        )
+        self._restart_after_cancel_wait = restart_after_cancel
+        self._await_timeout_seconds = 0.0 if restart_after_cancel else 5.0
+        self._last_retrigger_at = self._scan_start
+        self._retrigger_attempts = 0
+        if hasattr(self.app, "_scan_cancel_requested"):
+            self.app._scan_cancel_requested = False  # type: ignore[attr-defined]
+        if hasattr(self.app, "_daemon_scan_paused"):
+            self.app._daemon_scan_paused = False  # type: ignore[attr-defined]
 
         # UI feedback
-        self.query_one("#status", Static).update("Scanning")
-        self.query_one("#files", Static).update("Files:   collecting targets...")
+        self.query_one("#status", Static).update("Triggering scan via daemon...")
+        self.query_one("#files", Static).update("Files:   waiting for daemon...")
         self.query_one("#threats", Static).update("Threats: 0")
         self.query_one("#speed", Static).update("Speed:   —")
         self.query_one("#pbar", ProgressBar).update(progress=0)
-        self.query_one("#filelog", Static).update("  Collecting scan targets...")
+        if restart_after_cancel:
+            self.query_one("#filelog", Static).update(
+                "  Scan queued — waiting for daemon to finish previous cancel..."
+            )
+        else:
+            self.query_one("#filelog", Static).update("  Scan triggered — daemon is processing...")
         self.query_one("#theader", Static).update("THREATS DETECTED (0)")
         self.query_one("#threat-list", ListView).clear()
 
-        # Button states — disable start, change label
+        # Button states
         btn = self.query_one("#start-btn", Button)
         btn.disabled = True
         btn.label = "⏳ Scanning..."
+        self.query_one("#pause-btn", Button).disabled = False
         self.query_one("#cancel-btn", Button).disabled = False
         self.query_one("#back-btn", Button).disabled = False
 
@@ -364,46 +405,142 @@ class ScanScreen(Screen):
             except Exception:
                 pass
 
-        # Launch scan + poll timer
-        asyncio.create_task(self._run_scan())
+        # Set up event queue before triggering so SCAN_STARTED cannot be missed.
+        self._event_queue = asyncio.Queue()
+
+        # Trigger scan via daemon's trigger file
+        try:
+            append_trigger_command(self.scan_type)
+            self.query_one("#status", Static).update(f"Scanning ({self.scan_type})")
+        except OSError as exc:
+            if self._scan_history and self._run_id:
+                try:
+                    self._scan_history.cancel_scan(self._run_id)
+                except Exception:
+                    pass
+            self.query_one("#status", Static).update(f"ERROR: Cannot trigger scan: {exc}")
+            self._scanning = False
+            btn.disabled = False
+            btn.label = "▶  START SCAN"
+            return
+
         self.set_interval(0.15, self._poll_events, name="poll")
 
     def action_do_cancel(self) -> None:
+        """Cancel the daemon scan by writing 'cancel' to trigger file."""
         if not self._scanning:
             return
-        if self._cancel_token:
-            self._cancel_token.cancel()
 
-        # INSTANT cancel — don’t wait for scanner to return
+        elapsed = max(0.0, time.time() - self._scan_start)
+        files_scanned = 0
+        threats_count = 0
+        try:
+            state = self.app.pet_state  # type: ignore[attr-defined]
+            files_scanned = int(getattr(state, "last_scan_files_scanned", 0) or 0)
+            threats_count = int(getattr(state, "last_scan_threats_found", 0) or 0)
+        except Exception:
+            pass
+        if threats_count <= 0:
+            threats_count = len(self._threats)
+
+        # Tell daemon to cancel
+        try:
+            append_trigger_command("cancel")
+        except OSError as exc:
+            self.query_one("#status", Static).update(f"ERROR: Cannot cancel scan: {exc}")
+            return
+
+        # Persist cancellation immediately so history is durable even if the
+        # TUI is closed before daemon emits SCAN_COMPLETE(cancelled=True).
+        if self._scan_history and self._run_id:
+            try:
+                self._scan_history.cancel_scan(
+                    self._run_id,
+                    files_scanned=files_scanned,
+                    threats_found=threats_count,
+                    duration_seconds=elapsed,
+                )
+            except Exception:
+                pass
+
         self._scanning = False
         self._done = True
+        self._awaiting_daemon_events = False
         self._stop_poll()
-        self._unsub()
 
-        # Push partial scan results to PetState so main TUI shows them
+        # Update main app state
+        if hasattr(self.app, "_daemon_scan_active"):
+            self.app._daemon_scan_active = False  # type: ignore[attr-defined]
+        if hasattr(self.app, "_daemon_scan_paused"):
+            self.app._daemon_scan_paused = False  # type: ignore[attr-defined]
+        if hasattr(self.app, "_scan_cancel_requested"):
+            self.app._scan_cancel_requested = True  # type: ignore[attr-defined]
+        if hasattr(self.app, "_last_scan_cancel_at"):
+            self.app._last_scan_cancel_at = time.time()  # type: ignore[attr-defined]
+        if hasattr(self.app, "_scan_start_time"):
+            self.app._scan_start_time = 0.0  # type: ignore[attr-defined]
+
+        # Push partial scan results to PetState
         try:
             state = self.app.pet_state  # type: ignore[attr-defined]
             elapsed = time.time() - self._scan_start
             state.last_scan_duration = elapsed
             state.last_scan_time = time.time()
             state.last_scan_type = f"{self.scan_type} (cancelled)"
-            # files_scanned is already being tracked via SCAN_PROGRESS events
         except Exception:
             pass
 
-        # Clear app-level scan state
-        if hasattr(self.app, "_active_scan_state"):
-            self.app._active_scan_state = None  # type: ignore[attr-defined]
-        if hasattr(self.app, "_scan_start_time"):
-            self.app._scan_start_time = 0.0  # type: ignore[attr-defined]
+        # Clear main TUI scan widget
+        try:
+            from cyberpet.ui.pet import ScanStatsWidget
+            sw = self.app.query_one("#scan-panel", ScanStatsWidget)
+            sw.scan_active = False
+        except Exception:
+            pass
+        try:
+            if hasattr(self.app, "_refresh_scan_widget"):
+                self.app._refresh_scan_widget()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
-        # Reset this screen’s UI immediately
+        # Reset this screen's UI
         self.query_one("#status", Static).update("Cancelled")
         btn = self.query_one("#start-btn", Button)
         btn.disabled = False
         btn.label = "▶  START SCAN"
+        self.query_one("#pause-btn", Button).disabled = True
+        self.query_one("#pause-btn", Button).label = "⏸  PAUSE"
         self.query_one("#cancel-btn", Button).disabled = True
         self.query_one("#back-btn", Button).disabled = False
+
+    def action_do_pause(self) -> None:
+        """Toggle pause/resume on the daemon scan."""
+        if not self._scanning or self._done:
+            return
+
+        pause_btn = self.query_one("#pause-btn", Button)
+        if pause_btn.label == "⏸  PAUSE":
+            # Pause the scan
+            try:
+                append_trigger_command("pause")
+            except OSError as exc:
+                self.query_one("#status", Static).update(f"ERROR: Cannot pause scan: {exc}")
+                return
+            pause_btn.label = "▶  RESUME"
+            self.query_one("#status", Static).update("Paused")
+            if hasattr(self.app, "_daemon_scan_paused"):
+                self.app._daemon_scan_paused = True  # type: ignore[attr-defined]
+        else:
+            # Resume the scan
+            try:
+                append_trigger_command("resume")
+            except OSError as exc:
+                self.query_one("#status", Static).update(f"ERROR: Cannot resume scan: {exc}")
+                return
+            pause_btn.label = "⏸  PAUSE"
+            self.query_one("#status", Static).update(f"Scanning ({self.scan_type})")
+            if hasattr(self.app, "_daemon_scan_paused"):
+                self.app._daemon_scan_paused = False  # type: ignore[attr-defined]
 
     def action_do_reset(self) -> None:
         if self._scanning:
@@ -429,59 +566,111 @@ class ScanScreen(Screen):
 
     def action_go_back(self) -> None:
         if self._scanning:
-            # Save all live scan state to app for reconnection
+            # Going back while scan runs in daemon — just stop polling here
             self._stop_poll()
-            self.app._active_scan_state = {  # type: ignore[attr-defined]
-                "event_bus": self._event_bus,
-                "event_queue": self._event_queue,
-                "scanner": self._scanner,
-                "cancel_token": self._cancel_token,
-                "threats": list(self._threats),
-                "scan_start": self._scan_start,
-                "scan_type": self.scan_type,
-                "run_id": self._run_id,
-                "recent_files": list(self._recent_files),
-            }
-            # Set scan start time so main TUI can calculate speed
-            if hasattr(self.app, "_scan_start_time"):
-                self.app._scan_start_time = self._scan_start  # type: ignore[attr-defined]
-            # Immediately activate scan status on main TUI
+            # Reflect daemon-backed scan state on main TUI only when confirmed active.
             try:
                 from cyberpet.ui.pet import ScanStatsWidget
                 sw = self.app.query_one("#scan-panel", ScanStatsWidget)
-                sw.scan_active = True
+                daemon_active = bool(getattr(self.app, "_daemon_scan_active", False))
+                sw.scan_active = daemon_active
             except Exception:
                 pass
-            # DON'T unsub — the queue must keep receiving events
             self.app.pop_screen()
             return
         # Scan is done or never started — clean up
-        self._unsub()
         if hasattr(self.app, "_active_scan_state"):
             self.app._active_scan_state = None  # type: ignore[attr-defined]
-        self.app.pop_screen()
-
-    # ── Scan execution ───────────────────────────────────────────────────
-
-    async def _run_scan(self) -> None:
         try:
-            if self.scan_type == "quick":
-                report = await self._scanner.quick_scan(
-                    cancel_token=self._cancel_token
-                )
-            else:
-                report = await self._scanner.full_scan(
-                    cancel_token=self._cancel_token
-                )
-            await self._event_queue.put(("DONE", report))
-        except Exception as exc:
-            await self._event_queue.put(("ERROR", str(exc)))
+            if hasattr(self.app, "_refresh_scan_widget"):
+                self.app._refresh_scan_widget()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        self.app.pop_screen()
 
     # ── Event polling ────────────────────────────────────────────────────
 
     def _poll_events(self) -> None:
-        if not self._event_queue or self._done:
+        if self._event_queue is None or self._done:
             return
+
+        # Trigger was sent but no daemon events arrived: surface a clear error
+        # instead of showing a fake long-running scan state forever.
+        if self._scanning and self._awaiting_daemon_events:
+            elapsed = time.time() - self._scan_start
+            if (
+                self._restart_after_cancel_wait
+                and elapsed > self._retrigger_interval_seconds
+                and (time.time() - self._last_retrigger_at) >= self._retrigger_interval_seconds
+            ):
+                try:
+                    append_trigger_command(self.scan_type)
+                    self._last_retrigger_at = time.time()
+                    self._retrigger_attempts += 1
+                    self.query_one("#filelog", Static).update(
+                        "  Waiting for previous scan to cancel... "
+                        f"(re-queued {self._retrigger_attempts})"
+                    )
+                except OSError:
+                    pass
+
+            if self._await_timeout_seconds > 0 and elapsed > self._await_timeout_seconds:
+                stream_connected = bool(getattr(self.app, "_stream_connected", False))
+                if stream_connected:
+                    # Daemon is reachable but may still be busy unwinding a
+                    # previous scan. Re-queue and keep waiting instead of
+                    # failing the run prematurely.
+                    try:
+                        append_trigger_command(self.scan_type)
+                        self._last_retrigger_at = time.time()
+                        self._retrigger_attempts += 1
+                        self.query_one("#status", Static).update(
+                            f"Waiting for daemon ({self._retrigger_attempts})..."
+                        )
+                        self.query_one("#filelog", Static).update(
+                            "  No scan events yet — re-queued start request."
+                        )
+                    except OSError:
+                        pass
+                    self._scan_start = time.time()
+                    return
+                else:
+                    msg = "Not connected to daemon event stream."
+
+                self._scanning = False
+                self._awaiting_daemon_events = False
+                self._stop_poll()
+
+                if hasattr(self.app, "_daemon_scan_active"):
+                    self.app._daemon_scan_active = False  # type: ignore[attr-defined]
+                if hasattr(self.app, "_scan_start_time"):
+                    self.app._scan_start_time = 0.0  # type: ignore[attr-defined]
+
+                self.query_one("#status", Static).update(f"ERROR: {msg}")
+                self.query_one("#files", Static).update("Files:   0")
+                self.query_one("#speed", Static).update("Speed:   —")
+                self.query_one("#pbar", ProgressBar).update(progress=0)
+                self.query_one("#filelog", Static).update("  No live scan events received.")
+                if self._scan_history and self._run_id:
+                    try:
+                        elapsed = max(0.0, time.time() - self._scan_start)
+                        self._scan_history.cancel_scan(
+                            self._run_id,
+                            files_scanned=0,
+                            threats_found=len(self._threats),
+                            duration_seconds=elapsed,
+                        )
+                    except Exception:
+                        pass
+                btn = self.query_one("#start-btn", Button)
+                btn.disabled = False
+                btn.label = "▶  START SCAN"
+                pause_btn = self.query_one("#pause-btn", Button)
+                pause_btn.disabled = True
+                pause_btn.label = "⏸  PAUSE"
+                self.query_one("#cancel-btn", Button).disabled = True
+                self.query_one("#back-btn", Button).disabled = False
+                return
 
         from cyberpet.events import EventType
 
@@ -499,6 +688,14 @@ class ScanScreen(Screen):
             if isinstance(item, tuple) and len(item) == 2:
                 kind, payload = item
                 if kind == "DONE":
+                    # If we just requested a new run after cancellation, the
+                    # daemon may first emit completion for the previous run.
+                    if (
+                        self._awaiting_daemon_events
+                        and isinstance(payload, dict)
+                        and bool(payload.get("cancelled", False))
+                    ):
+                        continue
                     self._on_complete(payload)
                     return
                 elif kind == "ERROR":
@@ -508,7 +705,16 @@ class ScanScreen(Screen):
             if not hasattr(item, "type"):
                 continue
 
+            self._awaiting_daemon_events = False
+            self._restart_after_cancel_wait = False
+            if self._first_daemon_event_at == 0.0:
+                self._first_daemon_event_at = time.time()
+
             if item.type == EventType.SCAN_STARTED:
+                scan_type = item.data.get("scan_type", self.scan_type)
+                self.query_one("#status", Static).update(f"Scanning ({scan_type})")
+                if hasattr(self.app, "_daemon_scan_paused"):
+                    self.app._daemon_scan_paused = False  # type: ignore[attr-defined]
                 self.query_one("#files", Static).update(
                     "Files:   0 / discovering..."
                 )
@@ -541,12 +747,10 @@ class ScanScreen(Screen):
                     self._recent_files.append(current)
                     if len(self._recent_files) > self._max_filelog:
                         self._recent_files = self._recent_files[-self._max_filelog:]
-                    # Only update UI every 10 files to reduce DOM thrashing
-                    if len(self._recent_files) % 10 == 0 or pct >= 99:
-                        display = "\n".join(
-                            _trunc(f, 55) for f in reversed(self._recent_files[-30:])
-                        )
-                        self.query_one("#filelog", Static).update(display)
+                    display = "\n".join(
+                        _trunc(f, 55) for f in reversed(self._recent_files[-30:])
+                    )
+                    self.query_one("#filelog", Static).update(display)
 
             elif item.type == EventType.THREAT_FOUND:
                 self._add_threat(item.data)
@@ -610,16 +814,41 @@ class ScanScreen(Screen):
             self.app._active_scan_state = None  # type: ignore[attr-defined]
         if hasattr(self.app, "_scan_start_time"):
             self.app._scan_start_time = 0.0  # type: ignore[attr-defined]
+        if hasattr(self.app, "_daemon_scan_active"):
+            self.app._daemon_scan_active = False  # type: ignore[attr-defined]
+        if hasattr(self.app, "_daemon_scan_paused"):
+            self.app._daemon_scan_paused = False  # type: ignore[attr-defined]
+        if hasattr(self.app, "_scan_cancel_requested"):
+            self.app._scan_cancel_requested = False  # type: ignore[attr-defined]
 
         elapsed = time.time() - self._scan_start
-        cancelled = bool(self._cancel_token and self._cancel_token.is_cancelled())
-        count = len(self._threats)
+        cancelled = bool(
+            (isinstance(report, dict) and report.get("cancelled", False))
+            or (self._cancel_token and self._cancel_token.is_cancelled())
+        )
+
+        # Extract counts — report can be a ScanReport object or a dict
+        if isinstance(report, dict):
+            files_scanned = report.get("files_scanned", 0)
+            threats_found_list = report.get("threats_found", [])
+            threats_count = report.get("threats_found_count", len(threats_found_list))
+        else:
+            files_scanned = getattr(report, "files_scanned", 0)
+            threats_found_list = getattr(report, "threats_found", [])
+            threats_count = len(threats_found_list)
+
+        count = threats_count or len(self._threats)
 
         if cancelled:
             self.query_one("#status", Static).update("Cancelled")
             if self._scan_history and self._run_id:
                 try:
-                    self._scan_history.cancel_scan(self._run_id)
+                    self._scan_history.cancel_scan(
+                        self._run_id,
+                        files_scanned=files_scanned,
+                        threats_found=count,
+                        duration_seconds=elapsed,
+                    )
                 except Exception:
                     pass
         else:
@@ -632,13 +861,14 @@ class ScanScreen(Screen):
                     "Complete — System clean ✓"
                 )
             self.query_one("#pbar", ProgressBar).update(progress=100)
+            self.query_one("#files", Static).update(f"Files:   {files_scanned:,}")
 
             if self._scan_history and self._run_id:
                 try:
                     self._scan_history.complete_scan(
                         self._run_id,
-                        files_scanned=getattr(report, "files_scanned", 0),
-                        threats_found=len(getattr(report, "threats_found", [])),
+                        files_scanned=files_scanned,
+                        threats_found=count,
                         duration_seconds=elapsed,
                     )
                 except Exception:
@@ -647,26 +877,46 @@ class ScanScreen(Screen):
         # Update main pet UI state
         self._update_pet_state(report, cancelled)
 
+        # Clear main TUI scan widget progress bar
+        try:
+            from cyberpet.ui.pet import ScanStatsWidget
+            sw = self.app.query_one("#scan-panel", ScanStatsWidget)
+            sw.scan_active = False
+        except Exception:
+            pass
+
         # Re-enable buttons — label goes back to START SCAN
         btn = self.query_one("#start-btn", Button)
         btn.disabled = False
         btn.label = "▶  START SCAN"
+        self.query_one("#pause-btn", Button).disabled = True
+        self.query_one("#pause-btn", Button).label = "⏸  PAUSE"
         self.query_one("#cancel-btn", Button).disabled = True
         self.query_one("#back-btn", Button).disabled = False
         self._show_prev()
 
-        # Backfill threats the poller may have missed
-        known = {t["filepath"] for t in self._threats}
-        for t in getattr(report, "threats_found", []):
-            if t.filepath not in known:
-                self._add_threat({
-                    "filepath": t.filepath,
-                    "threat_score": t.threat_score,
-                    "threat_reason": t.threat_reason,
-                    "threat_category": t.threat_category,
-                    "matched_rules": t.matched_rules,
-                    "file_hash": t.file_hash,
-                })
+        # Notify the user
+        if not cancelled:
+            elapsed_m, elapsed_s = divmod(int(elapsed), 60)
+            dur = f"{elapsed_m}m {elapsed_s}s" if elapsed_m else f"{elapsed_s}s"
+            self.notify(
+                f"Scan complete — {files_scanned:,} files, {count} threats ({dur})",
+                severity="information" if count == 0 else "warning",
+            )
+
+        # Backfill threats the poller may have missed (only for report objects)
+        if not isinstance(report, dict):
+            known = {t["filepath"] for t in self._threats}
+            for t in getattr(report, "threats_found", []):
+                if t.filepath not in known:
+                    self._add_threat({
+                        "filepath": t.filepath,
+                        "threat_score": t.threat_score,
+                        "threat_reason": t.threat_reason,
+                        "threat_category": t.threat_category,
+                        "matched_rules": t.matched_rules,
+                        "file_hash": t.file_hash,
+                    })
 
     def _update_pet_state(self, report: Any, cancelled: bool) -> None:
         """Push scan results into the main PetState so the pet dashboard updates."""
@@ -677,9 +927,14 @@ class ScanScreen(Screen):
             if not cancelled:
                 state.last_scan_time = time.time()
                 state.last_scan_type = self.scan_type
-                state.last_scan_files_scanned = getattr(report, "files_scanned", 0)
-                state.last_scan_threats_found = len(getattr(report, "threats_found", []))
-                state.threats_blocked += len(getattr(report, "threats_found", []))
+                if isinstance(report, dict):
+                    state.last_scan_files_scanned = report.get("files_scanned", 0)
+                    state.last_scan_threats_found = report.get("threats_found_count", 0)
+                    state.threats_blocked += report.get("threats_found_count", 0)
+                else:
+                    state.last_scan_files_scanned = getattr(report, "files_scanned", 0)
+                    state.last_scan_threats_found = len(getattr(report, "threats_found", []))
+                    state.threats_blocked += len(getattr(report, "threats_found", []))
             else:
                 state.last_scan_time = time.time()
                 state.last_scan_type = f"{self.scan_type} (cancelled)"
@@ -696,6 +951,17 @@ class ScanScreen(Screen):
             self.app._active_scan_state = None  # type: ignore[attr-defined]
         if hasattr(self.app, "_scan_start_time"):
             self.app._scan_start_time = 0.0  # type: ignore[attr-defined]
+        if self._scan_history and self._run_id:
+            try:
+                elapsed = max(0.0, time.time() - self._scan_start)
+                self._scan_history.cancel_scan(
+                    self._run_id,
+                    files_scanned=0,
+                    threats_found=len(self._threats),
+                    duration_seconds=elapsed,
+                )
+            except Exception:
+                pass
         self.query_one("#status", Static).update(f"ERROR: {msg}")
         btn = self.query_one("#start-btn", Button)
         btn.disabled = False
@@ -715,7 +981,7 @@ class ScanScreen(Screen):
 
     def _unsub(self) -> None:
         try:
-            if self._event_queue and self._event_bus:
+            if self._event_queue is not None and self._event_bus:
                 if self._event_queue in self._event_bus._subscribers:
                     self._event_bus._subscribers.remove(self._event_queue)
         except Exception:

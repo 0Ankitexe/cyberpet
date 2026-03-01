@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import time
+from datetime import datetime
 
 import psutil  # type: ignore[import]
 
@@ -84,6 +85,15 @@ class EventStreamServer:
         """Keep the connection open until the client disconnects."""
         self._writers.append(writer)
         log_info(f"TUI client connected (clients={len(self._writers)})", module="daemon")
+        # Send a one-time snapshot so a freshly opened TUI can render
+        # the latest scan status immediately, even before new events arrive.
+        try:
+            snapshot = self._build_last_scan_snapshot_payload()
+            if snapshot:
+                writer.write((json.dumps(snapshot, default=str) + "\n").encode())
+                await writer.drain()
+        except Exception:
+            pass
         try:
             await reader.read()  # block until client closes
         finally:
@@ -98,31 +108,149 @@ class EventStreamServer:
 
     async def _broadcast(self) -> None:
         """Subscribe to EventBus and push every event to all connected TUI clients."""
+        # Only persist events the TUI event log actually displays
+        _PERSIST_TYPES = {
+            "CMD_BLOCKED", "CMD_WARNED", "THREAT_DETECTED", "THREAT_FOUND",
+            "QUARANTINE_SUCCESS", "FILE_ACCESS_BLOCKED", "FILE_ACCESS_SUSPICIOUS",
+            "SCAN_COMPLETE",
+        }
+        _EVENTS_FILE = "/var/log/cyberpet/events.jsonl"
+        _MAX_EVENTS = 100
+
         try:
             async for event in self.event_bus.subscribe():
-                if not self._writers:
-                    continue
-                line = json.dumps({
+                payload = {
                     "type": event.type.value,
                     "source": event.source,
                     "data": event.data,
                     "severity": event.severity,
                     "timestamp": event.timestamp.isoformat(),
-                }) + "\n"
-                dead: list[asyncio.StreamWriter] = []
-                for writer in self._writers:
+                }
+                line = json.dumps(payload, default=str) + "\n"
+
+                # Broadcast to connected TUI clients
+                if self._writers:
+                    dead: list[asyncio.StreamWriter] = []
+                    for writer in self._writers:
+                        try:
+                            writer.write(line.encode())
+                            await writer.drain()
+                        except Exception:
+                            dead.append(writer)
+                    for w in dead:
+                        if w in self._writers:
+                            self._writers.remove(w)
+
+                # Persist interesting events for TUI replay
+                if event.type.value in _PERSIST_TYPES:
                     try:
-                        writer.write(line.encode())
-                        await writer.drain()
+                        # Build a human-readable summary
+                        summary = event.data.get("summary", "") if isinstance(event.data, dict) else ""
+                        if not summary:
+                            summary = self._event_summary(event)
+                        persist_line = json.dumps({
+                            "type": event.type.value,
+                            "message": summary,
+                            "severity": event.severity,
+                            "timestamp": event.timestamp.isoformat(),
+                        }, default=str) + "\n"
+                        with open(_EVENTS_FILE, "a") as f:
+                            f.write(persist_line)
+                        # Cap at 100 lines
+                        with open(_EVENTS_FILE, "r") as f:
+                            lines = f.readlines()
+                        if len(lines) > _MAX_EVENTS:
+                            with open(_EVENTS_FILE, "w") as f:
+                                f.writelines(lines[-_MAX_EVENTS:])
                     except Exception:
-                        dead.append(writer)
-                for w in dead:
-                    if w in self._writers:
-                        self._writers.remove(w)
+                        pass
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             log_error(f"Event stream broadcast failed: {exc}", module="daemon")
+
+    @staticmethod
+    def _build_last_scan_snapshot_payload() -> dict | None:
+        """Build synthetic SCAN_COMPLETE payload for latest historical scan."""
+        history = None
+        try:
+            from cyberpet.scan_history import ScanHistory
+
+            history = ScanHistory()
+            last = history.get_last_scan()
+            if not last:
+                return None
+
+            scan_type = str(last.get("scan_type") or "scan")
+            status = str(last.get("status") or "").strip().lower()
+            cancelled = status == "cancelled"
+
+            try:
+                files_scanned = int(last.get("files_scanned", 0) or 0)
+            except (TypeError, ValueError):
+                files_scanned = 0
+
+            try:
+                threats_found = int(last.get("threats_found", 0) or 0)
+            except (TypeError, ValueError):
+                threats_found = 0
+
+            try:
+                duration_seconds = float(last.get("duration_seconds", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                duration_seconds = 0.0
+
+            completed_at = last.get("completed_at") or last.get("started_at")
+            if not isinstance(completed_at, str):
+                completed_at = ""
+
+            return {
+                "type": EventType.SCAN_COMPLETE.value,
+                "source": "daemon",
+                "severity": 0,
+                "timestamp": datetime.now().isoformat(),
+                "data": {
+                    "scan_type": scan_type,
+                    "cancelled": cancelled,
+                    "files_scanned": files_scanned,
+                    "threats_found_count": threats_found,
+                    "duration_seconds": duration_seconds,
+                    "completed_at": completed_at,
+                    "history_snapshot": True,
+                },
+            }
+        except Exception:
+            return None
+        finally:
+            if history is not None:
+                try:
+                    history.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _event_summary(event: Any) -> str:
+        """Build a short human-readable summary for an event."""
+        etype = event.type.value if hasattr(event.type, "value") else str(event.type)
+        data = event.data if isinstance(event.data, dict) else {}
+        if etype == "CMD_BLOCKED":
+            return f"Blocked: {data.get('command', '?')[:60]}"
+        elif etype == "CMD_WARNED":
+            return f"Warned: {data.get('command', '?')[:60]}"
+        elif etype == "THREAT_DETECTED":
+            return f"Threat: {data.get('filepath', '?')[:50]} (score {data.get('score', '?')})"
+        elif etype == "THREAT_FOUND":
+            return f"Found: {data.get('filepath', data.get('threat_category', '?'))[:50]}"
+        elif etype == "RL_DECISION":
+            return f"RL #{data.get('step', '?')}: {data.get('action_name', '?')} (r={data.get('reward', 0):+.1f})"
+        elif etype == "SCAN_COMPLETE":
+            return f"Scan done: {data.get('files_scanned', '?')} files, {data.get('threats', '?')} threats"
+        elif etype == "QUARANTINE_SUCCESS":
+            return f"Quarantined: {data.get('filepath', '?')[:50]}"
+        elif etype == "FILE_ACCESS_BLOCKED":
+            return f"Access blocked: {data.get('process_name', '?')} → {data.get('target_path', '?')[:40]}"
+        else:
+            return f"{etype}: {str(data)[:60]}"
 
 
 class CyberPetDaemon:
@@ -228,12 +356,20 @@ class CyberPetDaemon:
         # Start eBPF exec monitor (degrades gracefully)
         try:
             from cyberpet.ebpf.exec_monitor import ExecMonitor
-            if self.config.exec_monitor.get("enabled", True):
+            exec_enabled = bool(self.config.exec_monitor.get("enabled", True))
+            exec_force_enable = bool(self.config.exec_monitor.get("force_enable", False))
+            if exec_enabled and exec_force_enable:
                 self._exec_monitor = ExecMonitor(self.event_bus, self.config.exec_monitor)
                 started = await self._exec_monitor.start()
                 if started:
                     log_info("eBPF exec monitor started", module="daemon")
-        except Exception as exc:
+            elif exec_enabled and not exec_force_enable:
+                log_warn(
+                    "eBPF exec monitor disabled by safe default; set "
+                    "[exec_monitor].force_enable=true to attempt startup",
+                    module="daemon",
+                )
+        except (Exception, SystemExit) as exc:
             log_warn(f"eBPF exec monitor unavailable: {exc}", module="daemon")
             self._exec_monitor = None
 
@@ -248,23 +384,24 @@ class CyberPetDaemon:
                 started = await self._file_monitor.start()
                 if started:
                     log_info("File access monitor started", module="daemon")
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             log_warn(f"File access monitor unavailable: {exc}", module="daemon")
             self._file_monitor = None
 
         # V3: Start syscall anomaly monitor (degrades gracefully)
         self._syscall_monitor = None
-        try:
-            from cyberpet.ebpf.syscall_monitor import SyscallAnomalyMonitor
-            self._syscall_monitor = SyscallAnomalyMonitor(self.event_bus, self.config.rl)
-            started = await self._syscall_monitor.start()
-            if started:
-                log_info("Syscall anomaly monitor started", module="daemon")
-            else:
+        if self.config.rl.get("enabled", False):
+            try:
+                from cyberpet.ebpf.syscall_monitor import SyscallAnomalyMonitor
+                self._syscall_monitor = SyscallAnomalyMonitor(self.event_bus, self.config.rl)
+                started = await self._syscall_monitor.start()
+                if started:
+                    log_info("Syscall anomaly monitor started", module="daemon")
+                else:
+                    self._syscall_monitor = None
+            except (Exception, SystemExit) as exc:
+                log_warn(f"Syscall anomaly monitor unavailable: {exc}", module="daemon")
                 self._syscall_monitor = None
-        except Exception as exc:
-            log_warn(f"Syscall anomaly monitor unavailable: {exc}", module="daemon")
-            self._syscall_monitor = None
 
         # ── V3: Initialize shared FP memory and scan history ────────
         fp_memory = None
@@ -325,10 +462,8 @@ class CyberPetDaemon:
                 self._rl_engine.initialize()
                 self._rl_engine.set_env(env)
 
-                # Update pet state
-                self.pet_state.rl_state = (
-                    "WARMUP" if self._rl_engine.is_warmup else "TRAINING"
-                )
+                # Update pet state — starts READY (paused until user runs `model start`)
+                self.pet_state.rl_state = "READY"
 
                 # Start RL loop and FP event listener
                 rl_task = asyncio.create_task(self._rl_loop())
@@ -459,12 +594,82 @@ class CyberPetDaemon:
             pass
 
     async def _rl_loop(self) -> None:
-        """Run RL decision cycle every N seconds (V3)."""
+        """Run RL decision cycle every N seconds (V3).
+
+        Starts PAUSED — user must run `cyberpet model start` to begin training.
+        Watches /var/run/cyberpet_rl_control for start/stop signals.
+        """
         interval = self.config.rl.get("decision_interval_seconds", 30)
         model_dir = self.config.rl.get("model_path", "/var/lib/cyberpet/models/")
         state_file = os.path.join(model_dir, "rl_state.json")
+        control_file = "/var/run/cyberpet_rl_control"
+
+        # Create control file so unprivileged users can write to it
+        try:
+            if not os.path.exists(control_file):
+                with open(control_file, "w") as f:
+                    f.write("paused")
+                os.chmod(control_file, 0o666)
+        except OSError:
+            pass
+
+        # Start in READY (paused) state
+        rl_running = False
+        self.pet_state.rl_state = "READY"
+
+        # Write initial state file (uses engine's restored steps)
+        try:
+            import json as _json
+            os.makedirs(model_dir, exist_ok=True)
+            _json.dump(
+                {
+                    "total_steps": self._rl_engine.total_steps if self._rl_engine else 0,
+                    "avg_reward": round(self._rl_engine.avg_reward, 4) if self._rl_engine else 0.0,
+                    "rl_state": "READY",
+                    "last_action": "",
+                    "warmup_remaining": self._rl_engine.warmup_remaining if self._rl_engine else 0,
+                },
+                open(state_file, "w"),
+            )
+        except Exception:
+            pass
+
         try:
             while self._running and self._rl_engine:
+                # Check control file for start/stop signals
+                try:
+                    if os.path.exists(control_file):
+                        with open(control_file) as f:
+                            cmd = f.read().strip().lower()
+                        if cmd == "start" and not rl_running:
+                            rl_running = True
+                            log_info("RL training STARTED (via control command)", module="daemon")
+                        elif cmd == "stop" and rl_running:
+                            rl_running = False
+                            self.pet_state.rl_state = "PAUSED"
+                            log_info("RL training PAUSED (via control command)", module="daemon")
+                            # Write paused state
+                            try:
+                                _json.dump(
+                                    {
+                                        "total_steps": self._rl_engine.total_steps,
+                                        "avg_reward": round(self._rl_engine.avg_reward, 4),
+                                        "rl_state": "PAUSED",
+                                        "last_action": "",
+                                        "warmup_remaining": self._rl_engine.warmup_remaining,
+                                    },
+                                    open(state_file, "w"),
+                                )
+                            except Exception:
+                                pass
+                except OSError:
+                    pass
+
+                # Only train if running
+                if not rl_running:
+                    await asyncio.sleep(2)  # Check control file every 2s
+                    continue
+
                 step_info = self._rl_engine.run_step()
 
                 # Update pet state
@@ -502,6 +707,20 @@ class CyberPetDaemon:
                     data=step_info,
                     severity=0,
                 ))
+
+                # Persist decision to JSONL for TUI replay across restarts
+                decisions_file = os.path.join(model_dir, "rl_decisions.jsonl")
+                try:
+                    with open(decisions_file, "a") as f:
+                        f.write(_json.dumps(step_info, default=str) + "\n")
+                    # Cap at 50 lines (read all, keep last 50, rewrite)
+                    with open(decisions_file, "r") as f:
+                        lines = f.readlines()
+                    if len(lines) > 50:
+                        with open(decisions_file, "w") as f:
+                            f.writelines(lines[-50:])
+                except Exception:
+                    pass
 
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:

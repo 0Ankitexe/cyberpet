@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime
 from typing import Any
 
@@ -69,6 +70,64 @@ class ScanHistory:
     # ------------------------------------------------------------------
     # Scan lifecycle
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_timestamp(value: object) -> float:
+        """Parse ISO-8601 or legacy numeric timestamp values."""
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return 0.0
+            try:
+                return float(text)
+            except ValueError:
+                pass
+            try:
+                return datetime.fromisoformat(text).timestamp()
+            except ValueError:
+                if text.endswith("Z"):
+                    try:
+                        return datetime.fromisoformat(text[:-1] + "+00:00").timestamp()
+                    except ValueError:
+                        return 0.0
+        return 0.0
+
+    def claim_or_start_scan(self, scan_type: str, max_age_seconds: float = 120.0) -> int:
+        """Reuse a recent running row for scan_type, otherwise create one.
+
+        This lets daemon-owned scans attach to rows created by the scan TUI
+        immediately before trigger dispatch, while ignoring stale orphan rows.
+        """
+        row = self._conn.execute(
+            """SELECT id, started_at
+               FROM scan_runs
+               WHERE scan_type = ? AND status = 'running'
+               ORDER BY id DESC LIMIT 1""",
+            (scan_type,),
+        ).fetchone()
+        if row:
+            started_ts = self._parse_timestamp(row[1])
+            if started_ts > 0 and (time.time() - started_ts) <= max_age_seconds:
+                return int(row[0])
+        return self.start_scan(scan_type)
+
+    def cancel_all_running(self) -> int:
+        """Mark all currently running rows as cancelled.
+
+        Used on daemon startup to clean rows orphaned by previous daemon/TUI
+        exits so history queries always return a terminal status.
+        """
+        now = datetime.now().isoformat()
+        cur = self._conn.execute(
+            """UPDATE scan_runs
+               SET status = 'cancelled', completed_at = ?
+               WHERE status = 'running'""",
+            (now,),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
 
     def start_scan(self, scan_type: str) -> int:
         """Record a new scan run.  Returns the ``scan_run_id``."""
@@ -144,14 +203,34 @@ class ScanHistory:
         )
         self._conn.commit()
 
-    def cancel_scan(self, scan_run_id: int) -> None:
-        """Mark a scan as cancelled."""
+    def cancel_scan(
+        self,
+        scan_run_id: int,
+        files_scanned: int = 0,
+        threats_found: int = 0,
+        duration_seconds: float = 0.0,
+    ) -> None:
+        """Mark a scan as cancelled with optional partial metrics."""
         now = datetime.now().isoformat()
+        try:
+            files = int(files_scanned)
+        except (TypeError, ValueError):
+            files = 0
+        try:
+            threats = int(threats_found)
+        except (TypeError, ValueError):
+            threats = 0
+        try:
+            duration = float(duration_seconds)
+        except (TypeError, ValueError):
+            duration = 0.0
         self._conn.execute(
             """UPDATE scan_runs
-               SET status = 'cancelled', completed_at = ?
+               SET status = 'cancelled', completed_at = ?,
+                   files_scanned = ?, threats_found = ?,
+                   duration_seconds = ?
                WHERE id = ?""",
-            (now, scan_run_id),
+            (now, files, threats, duration, scan_run_id),
         )
         self._conn.commit()
 
@@ -166,7 +245,7 @@ class ScanHistory:
                 """SELECT id, scan_type, started_at, completed_at,
                           files_scanned, threats_found, status, duration_seconds
                    FROM scan_runs
-                   WHERE scan_type = ? AND status IN ('complete', 'cancelled')
+                   WHERE scan_type = ? AND status IN ('complete', 'completed', 'cancelled')
                    ORDER BY id DESC LIMIT 1""",
                 (scan_type,),
             ).fetchone()
@@ -175,7 +254,7 @@ class ScanHistory:
                 """SELECT id, scan_type, started_at, completed_at,
                           files_scanned, threats_found, status, duration_seconds
                    FROM scan_runs
-                   WHERE status IN ('complete', 'cancelled')
+                   WHERE status IN ('complete', 'completed', 'cancelled')
                    ORDER BY id DESC LIMIT 1""",
             ).fetchone()
         if not row:

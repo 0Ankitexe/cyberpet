@@ -236,10 +236,11 @@ class FileAccessMonitor:
 
         # Decision logic
         decision, reason, event_type, severity = self._evaluate_access(
-            process_name,
-            process_path,
-            target_path,
-            write_access,
+            process_name=process_name,
+            process_path=process_path,
+            target_path=target_path,
+            write_access=write_access,
+            pid=pid,
         )
 
         if is_permission_event:
@@ -273,8 +274,12 @@ class FileAccessMonitor:
         process_path: str,
         target_path: str,
         write_access: bool,
+        pid: int | None = None,
     ) -> tuple[int, str, EventType | None, int]:
         """Evaluate file access against block/suspicious policies."""
+        if pid is None:
+            pid = -1
+
         pname = process_name.strip()
         lname = pname.lower()
 
@@ -285,11 +290,24 @@ class FileAccessMonitor:
         # and legitimately needs to read system files for scanning.
         # NOTE: do NOT whitelist /usr/bin/python here — that would allow any
         # arbitrary Python script to bypass the shadow/sudoers deny rules.
+        # The venv Python exe often resolves to /usr/bin/python3.X (symlink
+        # target) instead of /opt/cyberpet/venv/bin/python, so we also check
+        # the process cmdline for the cyberpet module.
         _TRUSTED_PROCESS_PATHS = (
             "/opt/cyberpet/",
         )
         if any(process_path.startswith(p) for p in _TRUSTED_PROCESS_PATHS):
             return FAN_ALLOW, "", None, 0
+        # Check if this is our own daemon process by PID or cmdline
+        if os.getpid() == pid:
+            return FAN_ALLOW, "", None, 0
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace")
+            if "cyberpet" in cmdline:
+                return FAN_ALLOW, "", None, 0
+        except (OSError, ValueError):
+            pass
 
         if process_path.startswith(("/tmp", "/dev/shm")):
             if target_path in {"/etc/passwd", "/etc/shadow", "/etc/sudoers"}:

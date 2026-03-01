@@ -15,6 +15,8 @@ import time
 import click  # type: ignore[import]
 import psutil  # type: ignore[import]
 
+from cyberpet.scan_trigger import append_trigger_command
+
 
 @click.group()
 def main() -> None:
@@ -79,6 +81,15 @@ def start() -> None:
     try:
         asyncio.run(daemon.start())
     except Exception:
+        import traceback
+        crash_log = "/var/log/cyberpet/crash.log"
+        try:
+            os.makedirs(os.path.dirname(crash_log), exist_ok=True)
+            with open(crash_log, "a") as f:
+                f.write(f"\n--- CRASH {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
         sys.exit(1)
 
 
@@ -166,6 +177,8 @@ def pet() -> None:
 
     from cyberpet.daemon import start_ui  # type: ignore[import]
     start_ui()
+    # Ensure process exits cleanly after TUI closes
+    os._exit(0)
 
 
 @main.command()
@@ -271,10 +284,8 @@ def scan() -> None:
 @scan.command("quick")
 def scan_quick() -> None:
     """Trigger a quick scan of high-risk locations."""
-    trigger_file = "/var/run/cyberpet_scan_trigger"
     try:
-        with open(trigger_file, "w") as f:
-            f.write("quick")
+        append_trigger_command("quick")
         click.echo("Quick scan triggered")
     except PermissionError:
         click.echo(
@@ -292,10 +303,8 @@ def scan_quick() -> None:
 @scan.command("full")
 def scan_full() -> None:
     """Trigger a full filesystem scan."""
-    trigger_file = "/var/run/cyberpet_scan_trigger"
     try:
-        with open(trigger_file, "w") as f:
-            f.write("full")
+        append_trigger_command("full")
         click.echo("Full scan triggered")
     except PermissionError:
         click.echo(
@@ -518,6 +527,62 @@ def model_info():
         click.echo(f"    {a}")
 
 
+_RL_CONTROL_FILE = "/var/run/cyberpet_rl_control"
+
+
+@model.command("start")
+def model_start():
+    """Start RL brain training (the daemon must be running)."""
+    try:
+        with open(_RL_CONTROL_FILE, "w") as f:
+            f.write("start")
+        click.echo("🧠 RL training STARTED")
+        click.echo()
+        click.echo("  The pet will now begin learning from system observations.")
+        click.echo("  It starts in WARMUP mode (safe actions only).")
+        click.echo("  Destructive actions unlock after 500 steps (~4 hours).")
+        click.echo()
+        click.echo("  Monitor progress:")
+        click.echo("    cyberpet model status    # CLI status")
+        click.echo("    cyberpet pet → press b   # Brain Screen")
+        click.echo()
+        click.echo("  To pause:  cyberpet model stop")
+    except PermissionError:
+        click.echo("Permission denied. Try: sudo cyberpet model start", err=True)
+        sys.exit(1)
+    except FileNotFoundError:
+        click.echo(
+            "Control file not found. Is the daemon running?\n"
+            "  Start it: sudo cyberpet start",
+            err=True,
+        )
+        sys.exit(1)
+
+
+@model.command("stop")
+def model_stop():
+    """Pause RL brain training (model and progress are preserved)."""
+    try:
+        with open(_RL_CONTROL_FILE, "w") as f:
+            f.write("stop")
+        click.echo("⏸  RL training PAUSED")
+        click.echo()
+        click.echo("  The model and progress are preserved.")
+        click.echo("  Brain UI will show state: PAUSED")
+        click.echo()
+        click.echo("  To resume: cyberpet model start")
+    except PermissionError:
+        click.echo("Permission denied. Try: sudo cyberpet model stop", err=True)
+        sys.exit(1)
+    except FileNotFoundError:
+        click.echo(
+            "Control file not found. Is the daemon running?\n"
+            "  Start it: sudo cyberpet start",
+            err=True,
+        )
+        sys.exit(1)
+
+
 # ── V3 FP Memory Commands ────────────────────────────────────────
 
 @main.group()
@@ -565,6 +630,72 @@ def fp_clear():
         click.echo(f"Cleared {count} entries from false positive memory.")
     except Exception as exc:
         click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+# ── Autostart Command ────────────────────────────────────────────
+
+@main.group()
+def autostart():
+    """Manage CyberPet autostart on system boot."""
+    pass
+
+
+@autostart.command("on")
+def autostart_on():
+    """Enable CyberPet to start automatically on system boot."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "enable", "cyberpet"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            click.echo("✅ CyberPet will start automatically on boot.")
+            click.echo("   To undo: cyberpet autostart off")
+        else:
+            click.echo(f"Failed: {result.stderr.strip()}", err=True)
+            sys.exit(1)
+    except FileNotFoundError:
+        click.echo("Error: systemctl not found (systemd required)", err=True)
+        sys.exit(1)
+
+
+@autostart.command("off")
+def autostart_off():
+    """Disable CyberPet autostart on system boot."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "disable", "cyberpet"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            click.echo("⏹  CyberPet will NOT start automatically on boot.")
+            click.echo("   To re-enable: cyberpet autostart on")
+        else:
+            click.echo(f"Failed: {result.stderr.strip()}", err=True)
+            sys.exit(1)
+    except FileNotFoundError:
+        click.echo("Error: systemctl not found (systemd required)", err=True)
+        sys.exit(1)
+
+
+@autostart.command("status")
+def autostart_status():
+    """Check if CyberPet autostart is enabled."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-enabled", "cyberpet"],
+            capture_output=True, text=True,
+        )
+        state = result.stdout.strip()
+        if state == "enabled":
+            click.echo("✅ Autostart is ENABLED — CyberPet starts on boot.")
+        elif state == "disabled":
+            click.echo("⏹  Autostart is DISABLED.")
+            click.echo("   Enable with: sudo cyberpet autostart on")
+        else:
+            click.echo(f"Autostart status: {state}")
+    except FileNotFoundError:
+        click.echo("Error: systemctl not found (systemd required)", err=True)
         sys.exit(1)
 
 

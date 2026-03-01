@@ -24,6 +24,20 @@ MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 BACKUP_COUNT = 5
 
 
+def _build_null_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    """Create a non-throwing fallback logger.
+
+    Used when file-backed logger setup fails (for example in unprivileged
+    test environments without write access to /var/log).
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.addHandler(logging.NullHandler())
+    return logger
+
+
 def setup_logging(
     log_path: str = "/var/log/cyberpet/",
     log_level: str = "INFO",
@@ -84,7 +98,10 @@ def _get_main_logger() -> logging.Logger:
     """Return the main logger, initializing with defaults if needed."""
     global _main_logger
     if _main_logger is None:
-        setup_logging()
+        try:
+            setup_logging()
+        except Exception:
+            _main_logger = _build_null_logger("cyberpet")
     return _main_logger  # type: ignore[return-value]
 
 
@@ -92,7 +109,10 @@ def _get_threat_logger() -> logging.Logger:
     """Return the threat logger, initializing with defaults if needed."""
     global _threat_logger
     if _threat_logger is None:
-        setup_logging()
+        try:
+            setup_logging()
+        except Exception:
+            _threat_logger = _build_null_logger("cyberpet.threats", level=logging.WARNING)
     return _threat_logger  # type: ignore[return-value]
 
 

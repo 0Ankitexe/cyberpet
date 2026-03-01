@@ -36,6 +36,12 @@ ACTIONS: dict[int, str] = {
     7: "ESCALATE_LOCKDOWN",
 }
 
+# ── Issue 2: Named constants for state vector indices ──────────────────
+# Must match state_collector.py collect() layout exactly.
+IDX_THREAT_HISTORY_0 = 22   # Start of 8-slot threat history window
+IDX_ANOMALY_SCORE = 35      # Heuristic anomaly score
+IDX_FP_RATE_RECENT = 43     # Recent false positive rate
+
 
 class CyberPetEnv(gym.Env):
     """Gymnasium environment for CyberPet RL.
@@ -84,13 +90,15 @@ class CyberPetEnv(gym.Env):
         # Load prior data for reward function
         try:
             self._prior_data = prior.load()
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to load prior data for reward: {exc}")
             self._prior_data = {"confirmed_threat_categories": {}}
 
         # Safe file set from priors
         try:
             self.safe_file_set = prior.get_safe_file_penalty_set()
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to load safe file set: {exc}")
             self.safe_file_set = set()
 
         # Current observation (cached between reset/step)
@@ -167,6 +175,11 @@ class CyberPetEnv(gym.Env):
         """
         reward = 0.0
 
+        # Safety: ensure state vector is long enough
+        has_threat = len(new_state) > IDX_THREAT_HISTORY_0
+        has_anomaly = len(new_state) > IDX_ANOMALY_SCORE
+        has_fp_rate = len(new_state) > IDX_FP_RATE_RECENT
+
         # === POSITIVE REWARDS ===
 
         # Confirmed threat neutralised
@@ -184,11 +197,12 @@ class CyberPetEnv(gym.Env):
             reward += 5.0
 
         # System stability (low anomaly + low threat)
-        if len(new_state) > 35 and new_state[35] < 0.2 and len(new_state) > 22 and new_state[22] < 0.1:
-            reward += 1.0
+        if has_anomaly and has_threat:
+            if new_state[IDX_ANOMALY_SCORE] < 0.2 and new_state[IDX_THREAT_HISTORY_0] < 0.1:
+                reward += 1.0
 
         # Correct inaction
-        if action == 0 and len(new_state) > 22 and new_state[22] < 0.1:
+        if action == 0 and has_threat and new_state[IDX_THREAT_HISTORY_0] < 0.1:
             reward += 0.5
 
         # === NEGATIVE REWARDS ===
@@ -202,7 +216,7 @@ class CyberPetEnv(gym.Env):
 
         # Unnecessary action when no threat
         if action != 0 and not action_result.confirmed_threat and not action_result.suspicious_detected:
-            if len(new_state) > 22 and new_state[22] < 0.05:
+            if has_threat and new_state[IDX_THREAT_HISTORY_0] < 0.05:
                 reward -= 3.0
 
         # Missed threat
@@ -214,8 +228,8 @@ class CyberPetEnv(gym.Env):
             reward -= 0.5
 
         # High FP rate self-regulation
-        if len(new_state) > 43:
-            fp_rate = float(new_state[43])
+        if has_fp_rate:
+            fp_rate = float(new_state[IDX_FP_RATE_RECENT])
             if fp_rate > 0.3 and action in (2, 3, 7):
                 reward -= fp_rate * 3.0
 

@@ -22,22 +22,21 @@ from textual.screen import Screen
 from textual.widgets import Footer, Header, Static
 
 # Lazily import intelligence helper to avoid circular import
-_get_intelligence = None
+_get_intelligence_fn = None
+
+
 def _intel(steps, reward):
-    global _get_intelligence
-    if _get_intelligence is None:
+    global _get_intelligence_fn
+    if _get_intelligence_fn is None:
         from cyberpet.ui.pet import _get_intelligence
-    return _get_intelligence(steps, reward)
+        _get_intelligence_fn = _get_intelligence
+    return _get_intelligence_fn(steps, reward)
+
 
 # ── Constants ──────────────────────────────────────────────────────
 ACTION_LABELS = [
     "ALLOW", "LOG_WARN", "BLOCK_PROCESS", "QUARANTINE_FILE",
     "NETWORK_ISOLATE", "RESTORE_FILE", "TRIGGER_SCAN", "ESCALATE_LOCKDOWN",
-]
-
-ACTION_COLORS = [
-    "green", "yellow", "red", "bright_red",
-    "magenta", "cyan", "blue", "bright_red",
 ]
 
 ACTION_SHORT = ["ALW", "LOG", "BLK", "QRN", "NET", "RST", "SCN", "LCK"]
@@ -60,50 +59,41 @@ class RewardGraphWidget(Static):
         self.refresh()
 
     def render(self) -> str:
-        lines = ["┌─── Reward Trend (last 50 steps) ─────────────────────┐"]
+        title = "Reward Trend (last 50 steps)"
+        lines = [title, ""]
+
         if not self._rewards:
-            lines.append("│  No data yet — waiting for RL decisions...            │")
-            for _ in range(6):
-                lines.append("│                                                       │")
-            lines.append(f"└───────────────────────────────────────────────────────┘")
+            lines.append("No data yet — waiting for RL decisions...")
+            lines.append("")
+            lines.append("Run: cyberpet model start")
             return "\n".join(lines)
 
-        # Build sparkline
         rewards = list(self._rewards)
-        min_r = min(min(rewards), -1)
-        max_r = max(max(rewards), 1)
+        min_r = min(min(rewards), -1.0)
+        max_r = max(max(rewards), 1.0)
         rng = max_r - min_r or 1.0
 
-        # 6 rows of graph
         graph_rows = 6
-        graph_width = min(len(rewards), 50)
+        graph_width = min(len(rewards), 40)
         grid = [[" "] * graph_width for _ in range(graph_rows)]
 
         for col, r in enumerate(rewards[-graph_width:]):
             row = int((r - min_r) / rng * (graph_rows - 1))
             row = max(0, min(graph_rows - 1, row))
-            row = graph_rows - 1 - row  # invert for display
-            char = "█" if r >= 0 else "▒"
-            grid[row][col] = char
+            row = graph_rows - 1 - row
+            grid[row][col] = "█" if r >= 0 else "▒"
 
-        # Zero line
         zero_row = graph_rows - 1 - int((0 - min_r) / rng * (graph_rows - 1))
         zero_row = max(0, min(graph_rows - 1, zero_row))
 
         for row_idx, row_data in enumerate(grid):
             row_str = "".join(row_data)
-            label = f"{max_r - (row_idx / (graph_rows - 1)) * rng:>+6.1f}"
-            if row_idx == zero_row:
-                pad = 50 - len(row_str)
-                line_content = f"{label} ┤{row_str}{'─' * max(0, pad)}"
-            else:
-                pad = 50 - len(row_str)
-                line_content = f"{label} │{row_str}{' ' * max(0, pad)}"
-            lines.append(f"│{line_content[:53]:53}│")
+            label = f"{max_r - (row_idx / max(graph_rows - 1, 1)) * rng:>+6.1f}"
+            sep = "┤" if row_idx == zero_row else "│"
+            lines.append(f"{label} {sep}{row_str}")
 
-        avg_str = f"Avg: {self._avg_reward:+.2f}  |  Steps: {len(self._rewards)}"
-        lines.append(f"│  {avg_str:<51}│")
-        lines.append(f"└───────────────────────────────────────────────────────┘")
+        lines.append("")
+        lines.append(f"Avg: {self._avg_reward:+.2f}  |  Points: {len(self._rewards)}")
         return "\n".join(lines)
 
 
@@ -122,22 +112,19 @@ class ActionDistWidget(Static):
         self.refresh()
 
     def render(self) -> str:
-        lines = ["┌─── Action Distribution ───────────────────────────────┐"]
+        lines = ["Action Distribution", ""]
         total = max(sum(self._counts.values()), 1)
 
         for i in range(8):
             count = self._counts.get(i, 0)
             pct = count / total * 100 if total > 0 else 0
-            bar_len = int(pct / 100 * 30)
-            bar = "█" * bar_len + "░" * (30 - bar_len)
+            bar_len = int(pct / 100 * 20)
+            bar = "█" * bar_len + "░" * (20 - bar_len)
             label = ACTION_SHORT[i]
-            pct_str = f"{pct:5.1f}%"
-            count_str = f"({count})"
-            line = f"│  {label} {bar} {pct_str} {count_str:<6}│"
-            lines.append(f"{line[:55]:55}│" if len(line) > 55 else line)
+            lines.append(f"{label} {bar} {pct:5.1f}% ({count})")
 
-        lines.append(f"│  Total: {total:<44}│")
-        lines.append("└───────────────────────────────────────────────────────┘")
+        lines.append("")
+        lines.append(f"Total decisions: {total}")
         return "\n".join(lines)
 
 
@@ -171,7 +158,6 @@ class DecisionLogWidget(VerticalScroll):
             reward = d.get("reward", 0.0)
             explanation = d.get("explanation", "")
 
-            # Color by reward
             if reward > 0:
                 style = "green"
             elif reward < -1:
@@ -179,19 +165,16 @@ class DecisionLogWidget(VerticalScroll):
             else:
                 style = "dim"
 
-            header = f"#{step} {action:<18} {reward:>+6.1f}"
-            entry = Text(header, style=style, no_wrap=True)
-            self.mount(Static(entry))
+            header = f"#{step}  {action:<18}  {reward:>+6.1f}"
+            self.mount(Static(Text(header, style=style, no_wrap=True)))
 
             if explanation:
-                # Truncate explanation
-                expl_short = explanation[:60] + "..." if len(explanation) > 60 else explanation
-                expl_text = Text(f"  {expl_short}", style="dim italic", no_wrap=True)
-                self.mount(Static(expl_text))
+                expl = explanation[:55]
+                self.mount(Static(Text(f"  {expl}", style="dim italic", no_wrap=True)))
 
         if not self._decisions:
             self.mount(Static(Text(
-                "  No decisions yet — waiting for RL loop...",
+                "No decisions yet\nRun: cyberpet model start",
                 style="dim italic",
             )))
 
@@ -201,7 +184,7 @@ class DecisionLogWidget(VerticalScroll):
 # ── Brain Status Widget ───────────────────────────────────────────
 
 class BrainStatusWidget(Static):
-    """Static panel showing model info and brain health."""
+    """Panel showing model info and brain health."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -210,7 +193,7 @@ class BrainStatusWidget(Static):
         self._model_updated = ""
         self._total_steps = 0
         self._avg_reward = 0.0
-        self._rl_state = "DISABLED"
+        self._rl_state = "READY"
         self._warmup_remaining = 0
         self._fp_impact = ""
         self._prior_summary = ""
@@ -237,77 +220,63 @@ class BrainStatusWidget(Static):
         self.refresh()
 
     def render(self) -> str:
-        lines = ["┌─── Brain Status ──────────────────────────────────────┐"]
+        lines = ["Brain Status", ""]
 
         # Intelligence level
         try:
             intel = _intel(self._total_steps, self._avg_reward)
-            level_str = f"{intel['emoji']} {intel['level']} — {intel['desc']}"
-            lines.append(f"│  {level_str:<51}│")
+            lines.append(f"{intel['level']} - {intel['desc']}")
+
             iq = intel['iq']
-            iq_bar_len = int(iq / 100 * 30)
-            iq_bar = '█' * iq_bar_len + '░' * (30 - iq_bar_len)
-            lines.append(f"│  IQ  {iq_bar} {iq:>3}/100    │")
+            bar_len = int(iq / 100 * 25)
+            if iq > 0 and bar_len == 0:
+                bar_len = 1
+            iq_bar = "█" * bar_len + "░" * (25 - bar_len)
+            lines.append(f"IQ  {iq_bar}  {iq}/100")
+
             if intel['next_milestone']:
-                eta = f"→ {intel['next_milestone']} in ~{intel['eta']} ({intel['steps_to_next']} steps)"
-                lines.append(f"│  {eta:<51}│")
+                lines.append(f"  > {intel['next_milestone']} in ~{intel['eta']} ({intel['steps_to_next']} steps)")
         except Exception:
             pass
 
-        lines.append("│                                                       │")
+        lines.append("")
 
-        # State with color indicator
+        # State
         state_display = self._rl_state
         if self._rl_state == "WARMUP":
             state_display = f"WARMUP ({self._warmup_remaining} steps left)"
-        lines.append(f"│  State:    {state_display:<42}│")
+        elif self._rl_state in ("READY", "PAUSED"):
+            state_display = f"{self._rl_state} - run: cyberpet model start"
+        lines.append(f"State:   {state_display}")
+        lines.append(f"Steps:   {self._total_steps:,}")
+        lines.append(f"Reward:  {self._avg_reward:+.3f}")
 
-        # Steps
-        steps_fmt = f"{self._total_steps:,}"
-        lines.append(f"│  Steps:    {steps_fmt:<42}│")
-
-        # Reward
-        lines.append(f"│  Reward:   {self._avg_reward:>+8.3f}{'':<34}│")
-
-        lines.append("│                                                       │")
+        lines.append("")
 
         # Model info
         if self._model_path:
-            basename = os.path.basename(self._model_path)
-            lines.append(f"│  Model:    {basename:<42}│")
-            lines.append(f"│  Size:     {self._model_size:<42}│")
-            lines.append(f"│  Updated:  {self._model_updated:<42}│")
+            lines.append(f"Model:   {os.path.basename(self._model_path)}")
+            lines.append(f"Size:    {self._model_size}")
+            lines.append(f"Updated: {self._model_updated}")
+        elif self._rl_state in ("READY", "PAUSED"):
+            lines.append("Model:   Waiting to start training")
+            lines.append("         Run: cyberpet model start")
+        elif self._rl_state in ("WARMUP", "TRAINING"):
+            lines.append("Model:   Training (no checkpoint yet)")
+            lines.append(f"         Checkpoint at {240 - (self._total_steps % 240)} steps")
         else:
-            lines.append("│  Model:    Not found                                   │")
-
-        lines.append("│                                                       │")
+            lines.append("Model:   No model yet")
 
         # FP analysis
         if self._fp_impact:
-            # Wrap to 50 chars
-            words = self._fp_impact.split()
-            fp_lines = []
-            current = ""
-            for w in words:
-                if len(current) + len(w) + 1 > 49:
-                    fp_lines.append(current)
-                    current = w
-                else:
-                    current = f"{current} {w}" if current else w
-            if current:
-                fp_lines.append(current)
-            lines.append("│  FP Impact:                                           │")
-            for fl in fp_lines[:3]:
-                lines.append(f"│    {fl:<49}│")
+            lines.append("")
+            lines.append(f"FP Impact: {self._fp_impact}")
 
         # Prior summary
         if self._prior_summary:
-            lines.append("│                                                       │")
-            lines.append("│  Prior Knowledge:                                     │")
-            ps = self._prior_summary[:49]
-            lines.append(f"│    {ps:<49}│")
+            lines.append("")
+            lines.append(f"Priors: {self._prior_summary}")
 
-        lines.append("└───────────────────────────────────────────────────────┘")
         return "\n".join(lines)
 
 
@@ -335,28 +304,31 @@ class BrainScreen(Screen):
         width: 50%;
         height: 100%;
         border: round #00ff88;
-        padding: 0 1;
+        padding: 1 2;
+        color: #00ff88;
     }
 
     #action-dist {
         width: 50%;
         height: 100%;
         border: round cyan;
-        padding: 0 1;
+        padding: 1 2;
+        color: cyan;
     }
 
     #decision-log {
         width: 55%;
         height: 100%;
         border: round yellow;
-        padding: 0 1;
+        padding: 1 2;
     }
 
     #brain-info {
         width: 45%;
         height: 100%;
         border: round magenta;
-        padding: 0 1;
+        padding: 1 2;
+        color: magenta;
     }
     """
 
@@ -365,12 +337,13 @@ class BrainScreen(Screen):
         ("b", "go_back", "Back"),
     ]
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, initial_decisions: list[dict] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._reward_graph = RewardGraphWidget(id="reward-graph")
         self._action_dist = ActionDistWidget(id="action-dist")
         self._decision_log = DecisionLogWidget(id="decision-log")
         self._brain_status = BrainStatusWidget(id="brain-info")
+        self._initial_decisions = initial_decisions or []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -383,7 +356,17 @@ class BrainScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        """Load initial model info."""
+        """Load initial model info and replay accumulated decisions."""
+        self._load_model_info()
+        self._load_state_file()
+        # Replay accumulated decisions so the screen opens with full history
+        for d in self._initial_decisions:
+            self.push_decision(d)
+        # Refresh status every 5 seconds while brain screen is open
+        self.set_interval(5.0, self._refresh_status)
+
+    def _refresh_status(self) -> None:
+        """Periodically update brain status from rl_state.json."""
         self._load_model_info()
         self._load_state_file()
 
@@ -432,20 +415,16 @@ class BrainScreen(Screen):
 
     def push_decision(self, decision: dict) -> None:
         """Called by the main app when an RL_DECISION event arrives."""
-        # Update reward graph
         reward = decision.get("reward", 0.0)
         self._reward_graph.push_reward(reward)
 
-        # Update action distribution
         action = decision.get("action", 0)
         counts = self._action_dist._counts.copy()
         counts[action] = counts.get(action, 0) + 1
         self._action_dist.update_counts(counts)
 
-        # Update decision log
         self._decision_log.add_decision(decision)
 
-        # Update status
         self._brain_status.update_status({
             "total_steps": decision.get("step", 0),
             "avg_reward": decision.get("avg_reward", 0.0),

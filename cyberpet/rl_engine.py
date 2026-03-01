@@ -9,9 +9,11 @@ Orchestrates the full RL lifecycle:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
+from collections import deque
 from typing import Any, TYPE_CHECKING
 
 from cyberpet.events import Event, EventBus, EventType
@@ -37,6 +39,9 @@ _DESTRUCTIVE_FALLBACK = {              # destructive → safe fallback
     4: 0,  # NETWORK_ISOLATE → ALLOW
     7: 0,  # ESCALATE_LOCKDOWN → ALLOW
 }
+
+# Default PPO batch size (n_steps) — model trains after this many steps
+_DEFAULT_N_STEPS = 512
 
 
 class RLEngine:
@@ -70,7 +75,7 @@ class RLEngine:
         rl_cfg = getattr(config, "rl", {})
         if isinstance(rl_cfg, dict):
             self._model_dir = rl_cfg.get("model_path", "/var/lib/cyberpet/models/")
-            self._checkpoint_interval = rl_cfg.get("checkpoint_interval_steps", 3600)
+            self._checkpoint_interval = rl_cfg.get("checkpoint_interval_steps", 240)
             self._warmup_no_priors = rl_cfg.get("warmup_steps_no_priors", 100)
             self._warmup_with_priors = rl_cfg.get("warmup_steps_with_priors", 50)
             self._warmup_deep = rl_cfg.get("warmup_steps_deep_priors", 25)
@@ -78,7 +83,7 @@ class RLEngine:
             self._learning_safe_steps = rl_cfg.get("learning_safe_steps", _DEFAULT_LEARNING_SAFE_STEPS)
         else:
             self._model_dir = getattr(rl_cfg, "model_path", "/var/lib/cyberpet/models/")
-            self._checkpoint_interval = getattr(rl_cfg, "checkpoint_interval_steps", 3600)
+            self._checkpoint_interval = getattr(rl_cfg, "checkpoint_interval_steps", 240)
             self._warmup_no_priors = getattr(rl_cfg, "warmup_steps_no_priors", 100)
             self._warmup_with_priors = getattr(rl_cfg, "warmup_steps_with_priors", 50)
             self._warmup_deep = getattr(rl_cfg, "warmup_steps_deep_priors", 25)
@@ -95,8 +100,15 @@ class RLEngine:
         self._last_checkpoint_step: int = 0
         self._safe_file_set: set[tuple[str, str]] = set()
         self._action_counts: dict[int, int] = {i: 0 for i in range(8)}
-        self._reward_history: list[float] = []
+        self._reward_history: deque[float] = deque(maxlen=1000)  # Issue 3: bounded
         self._initialized = False
+
+        # Issue 1: Track steps since last PPO batch update
+        self._n_steps: int = _DEFAULT_N_STEPS
+        self._steps_since_train: int = 0
+
+        # Issue 6: Action bias from prior knowledge
+        self._action_bias: dict[int, float] = {i: 1.0 for i in range(8)}
 
     @property
     def total_steps(self) -> int:
@@ -114,7 +126,7 @@ class RLEngine:
     def avg_reward(self) -> float:
         if not self._reward_history:
             return 0.0
-        window = self._reward_history[-100:]
+        window = list(self._reward_history)[-100:]
         return sum(window) / len(window)
 
     @property
@@ -145,10 +157,20 @@ class RLEngine:
         # 3. Load safe file set
         try:
             self._safe_file_set = self._prior.get_safe_file_penalty_set()
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to load safe file set: {exc}")
             self._safe_file_set = set()
 
-        # 4. Create or load model
+        # 4. Load action bias from prior knowledge (Issue 6)
+        try:
+            self._action_bias = self._prior.get_action_bias()
+            if any(v != 1.0 for v in self._action_bias.values()):
+                logger.info(f"Action bias from priors: {self._action_bias}")
+        except Exception as exc:
+            logger.warning(f"Failed to load action bias: {exc}")
+            self._action_bias = {i: 1.0 for i in range(8)}
+
+        # 5. Create or load model
         os.makedirs(self._model_dir, exist_ok=True)
         model_path = os.path.join(self._model_dir, _MODEL_FILENAME)
 
@@ -168,6 +190,32 @@ class RLEngine:
         else:
             self._model = self._create_fresh_model()
             logger.info("Created fresh PPO model")
+
+        # Read n_steps from the model so batch training aligns
+        if self._model is not None:
+            self._n_steps = getattr(self._model, "n_steps", _DEFAULT_N_STEPS)
+
+        # Restore training progress from last session
+        state_file = os.path.join(self._model_dir, "rl_state.json")
+        if os.path.exists(state_file):
+            try:
+                with open(state_file) as f:
+                    saved = json.load(f)
+                saved_steps = saved.get("total_steps", 0)
+                if saved_steps > 0:
+                    self._total_steps = saved_steps
+                    self._last_checkpoint_step = saved_steps
+                    # Seed reward history with saved avg so IQ is correct
+                    avg = saved.get("avg_reward", 0.0)
+                    seed_count = min(saved_steps, 100)
+                    for _ in range(seed_count):
+                        self._reward_history.append(avg)
+                    logger.info(
+                        f"Restored training state: step {saved_steps}, "
+                        f"avg_reward {avg:+.2f}"
+                    )
+            except Exception as exc:
+                logger.warning(f"Failed to restore rl_state.json: {exc}")
 
         self._initialized = True
 
@@ -214,12 +262,26 @@ class RLEngine:
         # Step
         new_obs, reward, done, truncated, info = self._env.step(action)
 
-        # Train
-        if hasattr(self._model, "learn"):
+        # Issue 6: Apply action bias from prior knowledge as reward multiplier
+        bias = self._action_bias.get(action, 1.0)
+        reward = float(reward) * bias
+
+        # Issue 1: Batch training — PPO needs n_steps before it updates weights
+        self._steps_since_train += 1
+        if self._steps_since_train >= self._n_steps:
             try:
-                self._model.learn(total_timesteps=1, reset_num_timesteps=False)
-            except Exception:
-                pass
+                self._model.learn(
+                    total_timesteps=self._n_steps,
+                    reset_num_timesteps=False,
+                )
+                logger.info(
+                    f"PPO batch update completed at step {self._total_steps} "
+                    f"(trained on {self._n_steps} samples, avg_reward={self.avg_reward:+.2f})"
+                )
+            except Exception as exc:
+                # Issue 4: Log instead of swallowing
+                logger.error(f"PPO training failed at step {self._total_steps}: {exc}")
+            self._steps_since_train = 0
 
         # Update stats
         self._total_steps += 1
@@ -235,14 +297,14 @@ class RLEngine:
 
         from cyberpet.action_executor import ACTION_NAMES
 
-        # T042: Generate human-readable explanation
+        # Generate human-readable explanation
         explanation = ""
         try:
             from cyberpet.rl_explainer import RLExplainer
             explainer = RLExplainer(rl_engine=self)
             explanation = explainer.explain(action, obs, None)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Explainer failed: {exc}")
 
         step_info = {
             "step": self._total_steps,
@@ -251,6 +313,7 @@ class RLEngine:
             "reward": float(reward),
             "avg_reward": self.avg_reward,
             "warmup": self.is_warmup,
+            "warmup_remaining": self.warmup_remaining,
             "explanation": explanation,
             "details": info,
         }
@@ -289,14 +352,31 @@ class RLEngine:
     # ── Private ────────────────────────────────────────────────────────
 
     def _create_fresh_model(self) -> Any:
-        from stable_baselines3 import PPO
+        # Issue 8: Import inside method with clear error
+        try:
+            from stable_baselines3 import PPO
+        except ImportError as exc:
+            raise RuntimeError(
+                "stable-baselines3 is required for RL engine. "
+                "Install with: pip install stable-baselines3"
+            ) from exc
+
+        try:
+            import gymnasium
+            import numpy as np
+            from cyberpet.state_collector import STATE_DIM
+        except ImportError as exc:
+            raise RuntimeError(
+                "gymnasium and numpy are required for RL engine. "
+                "Install with: pip install gymnasium numpy"
+            ) from exc
 
         # Create a temporary environment for model initialization
         if self._env is not None:
             env = self._env
         else:
-            # Use the dummy env for initial model creation
-            env = _DummyEnv()
+            # Use a minimal dummy env for initial model creation
+            env = _make_dummy_env()
 
         model = PPO(
             "MlpPolicy",
@@ -321,26 +401,35 @@ class RLEngine:
         return model
 
 
-try:
-    import gymnasium as _gymnasium
-    import numpy as _np
-    from cyberpet.state_collector import STATE_DIM as _STATE_DIM
+def _make_dummy_env() -> Any:
+    """Create a minimal gymnasium environment for PPO model initialization.
 
-    class _DummyEnv(_gymnasium.Env):
+    Issue 8: Moved out of module-level try/except so errors are clear.
+    """
+    try:
+        import gymnasium
+        import numpy as np
+        from cyberpet.state_collector import STATE_DIM
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cannot create dummy env: gymnasium/numpy not installed"
+        ) from exc
+
+    class _DummyEnv(gymnasium.Env):
         """Minimal gymnasium environment stub for PPO model creation."""
 
         def __init__(self) -> None:
             super().__init__()
-            self.observation_space = _gymnasium.spaces.Box(
-                low=0.0, high=1.0, shape=(_STATE_DIM,), dtype=_np.float32,
+            self.observation_space = gymnasium.spaces.Box(
+                low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32,
             )
-            self.action_space = _gymnasium.spaces.Discrete(8)
+            self.action_space = gymnasium.spaces.Discrete(8)
 
         def reset(self, **kwargs):
-            return _np.zeros(_STATE_DIM, dtype=_np.float32), {}
+            return np.zeros(STATE_DIM, dtype=np.float32), {}
 
         def step(self, action):
-            return _np.zeros(_STATE_DIM, dtype=_np.float32), 0.0, False, False, {}
+            return np.zeros(STATE_DIM, dtype=np.float32), 0.0, False, False, {}
 
         def render(self):
             pass
@@ -348,5 +437,4 @@ try:
         def close(self):
             pass
 
-except ImportError:
-    _DummyEnv = None  # type: ignore[assignment,misc]
+    return _DummyEnv()

@@ -65,6 +65,7 @@ _FALLBACK_CONFIG: dict[str, Any] = {
     },
     "exec_monitor": {
         "enabled": True,
+        "force_enable": False,
     },
     "yara": {
         "rules_dir": "/etc/cyberpet/rules/",

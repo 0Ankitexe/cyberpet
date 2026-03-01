@@ -7,8 +7,11 @@ Connects to the EventBus for live updates.
 from __future__ import annotations
 
 import asyncio
+import math
+import os
 import random
 import time
+from collections import deque as _deque
 from datetime import datetime
 
 import psutil  # type: ignore[import]
@@ -19,6 +22,7 @@ from textual.reactive import reactive  # type: ignore[import]
 from textual.widgets import Footer, Header, ProgressBar, Static  # type: ignore[import]
 
 from cyberpet.events import Event, EventBus, EventType  # type: ignore[import]
+from cyberpet.scan_history import ScanHistory  # type: ignore[import]
 from cyberpet.state import PetState  # type: ignore[import]
 from cyberpet.ui.ascii_art import MoodArt  # type: ignore[import]
 from cyberpet.ui.brain_screen import BrainScreen  # type: ignore[import]
@@ -181,31 +185,29 @@ class SystemStatsWidget(Static):
             │   CPU  [██████]  87.3%   │
         """
         uptime_str = self._format_uptime(self.uptime)
-        cpu_bar = self._bar(self.cpu)   # 6 chars wide
-        ram_bar = self._bar(self.ram)
+        cpu_bar = self._bar(self.cpu, 10)
+        ram_bar = self._bar(self.ram, 10)
 
-        # Exact widths (inner = 22, total = 24):
-        #  " CPU  [" (7) + bar(6) + "] " (2) + cpu:5.1f (5) + "% " (2) = 22
-        #  " Uptime: " (9) + uptime:>12s (12) + " " (1)               = 22
-        #  " Blocked:" (9) + threats:>12d (12) + " " (1)              = 22
-        #  " Checked:" (9) + intercepted:>12d (12) + " " (1)          = 22
         return (
-            "╭──────────────────────╮\n"
-            "│      System Stats    │\n"
-            "├──────────────────────┤\n"
+            "╭──────────────────────────╮\n"
+            "│       System Stats       │\n"
+            "├──────────────────────────┤\n"
             f"│ CPU  [{cpu_bar}] {self.cpu:5.1f}% │\n"
             f"│ RAM  [{ram_bar}] {self.ram:5.1f}% │\n"
-            "├──────────────────────┤\n"
-            f"│ Uptime: {uptime_str:>12s} │\n"
-            f"│ Blocked:{self.threats:>12d} │\n"
-            f"│ Checked:{self.intercepted:>12d} │\n"
-            "╰──────────────────────╯"
+            "├──────────────────────────┤\n"
+            f"│ Uptime:{uptime_str:>17s} │\n"
+            f"│ Blocked:{self.threats:>16d} │\n"
+            f"│ Checked:{self.intercepted:>16d} │\n"
+            "╰──────────────────────────╯"
         )
 
     @staticmethod
     def _bar(percent: float, width: int = 6) -> str:
         """Create a simple progress bar (6 chars wide by default)."""
         filled = int(percent / 100 * width)
+        # Ensure at least 1 block shows when value is above zero
+        if percent > 0 and filled == 0:
+            filled = 1
         return "█" * filled + "░" * (width - filled)
 
     @staticmethod
@@ -259,24 +261,33 @@ class EventLogWidget(VerticalScroll):
             self.mount(Static(entry))
         self.scroll_end(animate=False)
 
+    def clear_log(self) -> None:
+        """Clear all log entries."""
+        self._events.clear()
+        self.remove_children()
+
 
 # ── Intelligence Level System ─────────────────────────────────────
 # Maps steps + reward into a human-friendly level and score.
 
 _INTELLIGENCE_LEVELS = [
     # (min_steps, min_reward, name, emoji, description)
-    (0,      -999, "Newborn",  "🥒", "Just hatched, exploring randomly"),
-    (50,     -1.0, "Curious",  "🐣", "Starting to notice patterns"),
-    (200,     0.0, "Learning", "🧠", "Making connections, still mistakes"),
-    (500,     1.5, "Smart",    "⚡", "Solid decisions, rare false positives"),
-    (2000,    3.0, "Expert",   "🎓", "Battle-hardened, highly accurate"),
+    (0,      -999, "Newborn",   "🥒", "Just started, acting randomly"),
+    (50,     -1.0, "Learning",  "🐣", "Starting to see patterns"),
+    (100,     0.0, "Aware",     "🐥", "Recognising normal system state"),
+    (200,     1.0, "Curious",   "🐹", "Noticing anomalies"),
+    (500,     2.0, "Smart",     "🦊", "Making intentional decisions"),
+    (1000,    3.0, "Clever",    "🐺", "Predicting threat patterns"),
+    (2000,    4.0, "Brilliant", "🦁", "Expert-level cybersecurity decisions"),
 ]
 
 _MILESTONES = [
-    (50,   "Curious"),
-    (200,  "Learning"),
+    (50,   "Learning"),
+    (100,  "Aware"),
+    (200,  "Curious"),
     (500,  "Smart"),
-    (2000, "Expert"),
+    (1000, "Clever"),
+    (2000, "Brilliant"),
 ]
 
 
@@ -293,10 +304,27 @@ def _get_intelligence(steps: int, avg_reward: float) -> dict:
             level_desc = desc
 
     # Calculate IQ-like score (0-100 scale)
-    # Steps contribute 60%, reward contributes 40%
-    step_score = min(60, (steps / 2000) * 60)
-    reward_score = min(40, max(0, (avg_reward + 5) / 10) * 40)
-    iq = int(step_score + reward_score)
+    # Steps drive the ceiling — reward adjusts within that ceiling.
+    # At step 0: IQ = 0. At step 2000: IQ caps at 100.
+    # A log floor ensures early steps show *some* visible progress
+    # (step 1 → 1, step 14 → 2, step 50 → 3, step 200 → 5).
+    step_fraction = min(1.0, steps / 2000)          # 0.0 → 1.0
+    step_ceiling = step_fraction * 100               # 0 → 100
+
+    # Log floor: visible growth even at very low step counts
+    if steps > 0:
+        log_floor = min(5, math.log10(steps + 1) * 2)
+        step_ceiling = max(step_ceiling, log_floor)
+
+    reward_bonus = 0
+    if steps > 0:
+        # avg_reward in range ~[-20, +20]; normalise to [-1, +1]
+        norm_reward = max(-1.0, min(1.0, avg_reward / 20.0))
+        # bonus is ±20% of the step ceiling so it can only move the
+        # needle meaningfully once the pet has real training data
+        reward_bonus = norm_reward * 0.20 * step_ceiling
+
+    iq = int(max(0, min(100, step_ceiling + reward_bonus)))
 
     # Next milestone
     next_milestone = None
@@ -359,6 +387,8 @@ class BrainStatsWidget(Static):
         intel = _get_intelligence(self.rl_steps, self.rl_reward)
         level_line = f"{intel['emoji']} {intel['level']}"
         iq_bar_len = int(intel['iq'] / 100 * 14)
+        if intel['iq'] > 0 and iq_bar_len == 0:
+            iq_bar_len = 1
         iq_bar = "█" * iq_bar_len + "░" * (14 - iq_bar_len)
 
         lines = [
@@ -384,6 +414,8 @@ class BrainStatsWidget(Static):
             filled = int(pct / 100 * 14)
             bar = "█" * filled + "░" * (14 - filled)
             lines.append(f"│ Warmup {bar} {pct:>3}%│")
+        elif self.rl_state in ("READY", "PAUSED"):
+            lines.append("│ Run: model start      │")
 
         # Last action
         action_display = self.rl_action[:16]
@@ -576,6 +608,7 @@ class CyberPetApp(App):
         ("d", "toggle_dark", "Toggle Dark"),
         ("s", "open_scan_menu", "Scan"),
         ("b", "open_brain", "Brain"),
+        ("c", "clear_log", "Clear Log"),
     ]
     _MOOD_EVENT_TYPES = {
         EventType.CMD_BLOCKED,
@@ -609,6 +642,11 @@ class CyberPetApp(App):
         self._last_outcome_at = 0.0
         self._active_scan_state: dict | None = None
         self._scan_start_time: float = 0.0
+        self._daemon_scan_active: bool = False
+        self._daemon_scan_paused: bool = False
+        self._scan_cancel_requested: bool = False
+        self._last_scan_cancel_at: float = 0.0
+        self._rl_decisions: _deque[dict] = _deque(maxlen=50)
 
     def compose(self) -> ComposeResult:  # type: ignore[override]
         """Build the UI layout."""
@@ -638,7 +676,142 @@ class CyberPetApp(App):
         pet_widget = self.query_one("#pet-panel", PetFaceWidget)
         pet_widget.pet_name = self._pet_name
         self._apply_mood_theme(self.pet_state.current_mood)
+        self._load_persisted_scan_summary()
+        self._load_persisted_quarantine_count()
         self._refresh_scan_widget()
+
+        # Load persisted RL decisions for brain screen replay
+        self._load_persisted_decisions()
+        # Load persisted event log
+        self._load_persisted_events()
+
+    def _load_persisted_decisions(self) -> None:
+        """Read rl_decisions.jsonl and populate _rl_decisions + brain widget."""
+        import json as _json
+        try:
+            from cyberpet.config import Config
+            config = Config.load()
+            model_dir = config.rl.get("model_path", "/var/lib/cyberpet/models/")
+            decisions_file = os.path.join(model_dir, "rl_decisions.jsonl")
+            if not os.path.exists(decisions_file):
+                return
+            with open(decisions_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = _json.loads(line)
+                        self._rl_decisions.append(d)
+                        # Update brain stats widget
+                        state = self.pet_state
+                        state.rl_steps_trained = d.get("step", state.rl_steps_trained)
+                        state.rl_avg_reward = d.get("avg_reward", state.rl_avg_reward)
+                        state.rl_state = "WARMUP" if d.get("warmup", False) else "TRAINING"
+                    except (ValueError, KeyError):
+                        continue
+            # Push final state to brain widget
+            self._refresh_stats_widget()
+        except Exception:
+            pass
+
+    def _load_persisted_events(self) -> None:
+        """Read events.jsonl and replay into the event log widget."""
+        import json as _json
+        events_file = "/var/log/cyberpet/events.jsonl"
+        try:
+            if not os.path.exists(events_file):
+                return
+            log_widget = self.query_one("#event-log", EventLogWidget)
+            with open(events_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = _json.loads(line)
+                        msg = payload.get("message", payload.get("summary", ""))
+                        severity = payload.get("severity", 0)
+                        if msg:
+                            log_widget.add_event(msg, severity=severity)
+                    except (ValueError, KeyError):
+                        continue
+        except Exception:
+            pass
+
+    def _load_persisted_scan_summary(self) -> None:
+        """Read latest completed/cancelled scan from SQLite history."""
+        history: ScanHistory | None = None
+        try:
+            history = ScanHistory()
+            last_scan = history.get_last_scan()
+            if not last_scan:
+                return
+
+            state = self.pet_state
+            scan_type = self._clip_text(last_scan.get("scan_type", "scan"))
+            status = str(last_scan.get("status", "")).strip().lower()
+            if status == "cancelled":
+                status_label = "cancelled"
+            elif status == "complete":
+                status_label = "completed"
+            else:
+                status_label = "completed"
+            state.last_scan_type = f"{scan_type} ({status_label})"
+
+            try:
+                state.last_scan_files_scanned = int(last_scan.get("files_scanned", 0) or 0)
+            except (TypeError, ValueError):
+                state.last_scan_files_scanned = 0
+
+            try:
+                state.last_scan_threats_found = int(last_scan.get("threats_found", 0) or 0)
+            except (TypeError, ValueError):
+                state.last_scan_threats_found = 0
+
+            try:
+                state.last_scan_duration = float(last_scan.get("duration_seconds", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                state.last_scan_duration = 0.0
+
+            state.last_scan_time = self._parse_scan_timestamp(last_scan.get("completed_at"))
+            if state.last_scan_time <= 0:
+                state.last_scan_time = self._parse_scan_timestamp(
+                    last_scan.get("started_at")
+                )
+        except Exception:
+            pass
+        finally:
+            if history is not None:
+                try:
+                    history.close()
+                except Exception:
+                    pass
+
+    def _load_persisted_quarantine_count(self) -> None:
+        """Load current quarantined-file count from quarantine DB."""
+        import sqlite3
+
+        try:
+            from cyberpet.config import Config
+
+            config = Config.load()
+            vault_path = config.quarantine.get("vault_path", "/var/lib/cyberpet/quarantine/")
+            db_path = os.path.join(vault_path, "quarantine.db")
+            if not os.path.exists(db_path):
+                return
+
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM quarantine WHERE status = 'quarantined'"
+                ).fetchone()
+                if row:
+                    self.pet_state.files_quarantined = int(row[0] or 0)
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
     async def _event_listener(self) -> None:
         """Listen for events and update the UI.
@@ -670,12 +843,14 @@ class CyberPetApp(App):
             try:
                 reader, writer = await asyncio.open_unix_connection(stream_socket)
                 self._stream_connected = True
-                # Show a connected indicator in the log
-                try:
-                    log_widget = self.query_one("#event-log", EventLogWidget)
-                    log_widget.add_event("Connected to daemon event stream", severity=0)
-                except Exception:
-                    pass
+                # Only show connection message on first connect
+                if not getattr(self, '_first_connect_done', False):
+                    self._first_connect_done = True
+                    try:
+                        log_widget = self.query_one("#event-log", EventLogWidget)
+                        log_widget.add_event("Connected to daemon event stream", severity=0)
+                    except Exception:
+                        pass
 
                 async for raw_line in reader:
                     line = raw_line.decode("utf-8", errors="replace").strip()
@@ -693,11 +868,7 @@ class CyberPetApp(App):
 
                 writer.close()
                 self._stream_connected = False
-                try:
-                    log_widget = self.query_one("#event-log", EventLogWidget)
-                    log_widget.add_event("Daemon disconnected; reconnecting", severity=20)
-                except Exception:
-                    pass
+                # Silent reconnect — don't spam the log
 
             except PermissionError:
                 # Socket exists but we don't have permission (group not active yet).
@@ -756,6 +927,32 @@ class CyberPetApp(App):
     def _clip_text(value: object) -> str:
         """Normalize text to a single line for compact activity entries."""
         return " ".join(str(value).split())
+
+    @staticmethod
+    def _parse_scan_timestamp(value: object) -> float:
+        """Parse scan timestamps from ISO-8601 or legacy numeric formats."""
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            return ts if ts > 0 else 0.0
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return 0.0
+            try:
+                ts = float(text)
+                return ts if ts > 0 else 0.0
+            except ValueError:
+                pass
+            try:
+                return datetime.fromisoformat(text).timestamp()
+            except ValueError:
+                if text.endswith("Z"):
+                    try:
+                        return datetime.fromisoformat(text[:-1] + "+00:00").timestamp()
+                    except ValueError:
+                        return 0.0
+        return 0.0
 
     @staticmethod
     def _risk_label(severity: int) -> str:
@@ -884,6 +1081,13 @@ class CyberPetApp(App):
             filepath = self._clip_text(event.data.get("filepath", ""))
             state.last_threat_name = f"{threat_category}: {filepath}" if filepath else threat_category
             state.last_event_message = f"THREAT FILE: {threat_category}"
+            # Forward to active ScanScreen
+            try:
+                from cyberpet.ui.scan_screen import ScanScreen
+                if isinstance(self.screen, ScanScreen) and hasattr(self.screen, '_event_queue') and self.screen._event_queue is not None:
+                    self.screen._event_queue.put_nowait(event)
+            except Exception:
+                pass
         elif event.type == EventType.QUARANTINE_SUCCESS:
             category = self._clip_text(event.data.get("threat_category", "unknown"))
             path = self._clip_text(event.data.get("original_path", ""))
@@ -893,9 +1097,58 @@ class CyberPetApp(App):
             proc = self._clip_text(event.data.get("process_name", "process"))
             target = self._clip_text(event.data.get("target_path", ""))
             state.last_event_message = f"ACCESS BLOCKED: {proc} -> {target[:30]}"
+        elif event.type == EventType.SCAN_STARTED:
+            scan_type = self._clip_text(event.data.get("scan_type", "scan"))
+            self._daemon_scan_active = True
+            self._daemon_scan_paused = False
+            self._scan_cancel_requested = False
+            self._scan_start_time = time.time()
+            state.last_scan_type = scan_type
+            state.last_scan_files_scanned = 0
+            state.last_event_message = f"SCAN {scan_type.upper()}: started"
+
+            try:
+                scan_widget = self.query_one("#scan-panel", ScanStatsWidget)
+                scan_widget.scan_active = True
+                scan_widget.scan_percent = 0
+                scan_widget.scan_speed = 0.0
+                scan_widget.files_scanned = 0
+                scan_widget.threats_found = state.last_scan_threats_found
+            except Exception:
+                pass
+
+            # Clear scan file log for this new run.
+            try:
+                filelog = self.query_one("#scan-filelog", ScanFileLogWidget)
+                filelog.clear_log()
+            except Exception:
+                pass
+
+            # Forward to active ScanScreen
+            try:
+                from cyberpet.ui.scan_screen import ScanScreen
+                if isinstance(self.screen, ScanScreen) and hasattr(self.screen, '_event_queue') and self.screen._event_queue is not None:
+                    self.screen._event_queue.put_nowait(event)
+            except Exception:
+                pass
         elif event.type == EventType.SCAN_COMPLETE:
-            state.last_scan_time = time.time()
-            state.last_scan_type = self._clip_text(event.data.get("scan_type", "scan"))
+            is_history_snapshot = bool(event.data.get("history_snapshot", False))
+            if is_history_snapshot:
+                completed_at = event.data.get("completed_at")
+                parsed_snapshot_ts = self._parse_scan_timestamp(completed_at)
+                if parsed_snapshot_ts > 0:
+                    state.last_scan_time = parsed_snapshot_ts
+                else:
+                    state.last_scan_time = time.time()
+            else:
+                state.last_scan_time = time.time()
+            base_scan_type = self._clip_text(event.data.get("scan_type", "scan"))
+            cancelled = bool(event.data.get("cancelled", False))
+            state.last_scan_type = (
+                f"{base_scan_type} (cancelled)"
+                if cancelled
+                else f"{base_scan_type} (completed)"
+            )
             try:
                 state.last_scan_files_scanned = int(event.data.get("files_scanned", 0))
             except (TypeError, ValueError):
@@ -904,18 +1157,53 @@ class CyberPetApp(App):
                 state.last_scan_threats_found = int(event.data.get("threats_found_count", 0))
             except (TypeError, ValueError):
                 state.last_scan_threats_found = 0
-            state.last_event_message = (
-                f"SCAN {state.last_scan_type.upper()}: "
-                f"{state.last_scan_files_scanned} files, "
-                f"{state.last_scan_threats_found} threats"
-            )
+            try:
+                state.last_scan_duration = float(event.data.get("duration_seconds", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                state.last_scan_duration = 0.0
+            if cancelled:
+                state.last_event_message = (
+                    f"SCAN {base_scan_type.upper()}: cancelled at "
+                    f"{state.last_scan_files_scanned} files"
+                )
+            else:
+                state.last_event_message = (
+                    f"SCAN {state.last_scan_type.upper()}: "
+                    f"{state.last_scan_files_scanned} files, "
+                    f"{state.last_scan_threats_found} threats"
+                )
             # Clear active scan state on main TUI
             self._scan_start_time = 0.0
+            self._daemon_scan_active = False
+            self._daemon_scan_paused = False
+            self._scan_cancel_requested = False
+            if cancelled:
+                self._last_scan_cancel_at = time.time()
             try:
                 scan_widget = self.query_one("#scan-panel", ScanStatsWidget)
                 scan_widget.scan_active = False
             except Exception:
                 pass
+            # Forward to active ScanScreen
+            try:
+                from cyberpet.ui.scan_screen import ScanScreen
+                if isinstance(self.screen, ScanScreen) and hasattr(self.screen, '_event_queue') and self.screen._event_queue is not None:
+                    self.screen._event_queue.put_nowait(("DONE", event.data))
+            except Exception:
+                pass
+            # Notify only for live completions, not startup snapshot hydration.
+            if not is_history_snapshot:
+                if cancelled:
+                    self.notify(
+                        f"Scan cancelled — {state.last_scan_files_scanned:,} files scanned",
+                        severity="warning",
+                    )
+                else:
+                    self.notify(
+                        f"Scan complete — {state.last_scan_files_scanned:,} files, "
+                        f"{state.last_scan_threats_found} threats",
+                        severity="information" if state.last_scan_threats_found == 0 else "warning",
+                    )
         elif event.type == EventType.RL_DECISION:
             # V3: Live RL decision event
             d = event.data
@@ -948,21 +1236,34 @@ class CyberPetApp(App):
                     brain.rl_warmup_pct = max(0, 100 - int(warmup_remaining / total_warmup * 100))
             except Exception:
                 pass
-            # Push to BrainScreen if open
+            # Accumulate decisions for brain screen replay
+            self._rl_decisions.append(d)
+            # Also live-push to the brain screen if it's currently open
             try:
-                screen = self.screen
-                if isinstance(screen, BrainScreen):
-                    screen.push_decision(d)
+                if isinstance(self.screen, BrainScreen):
+                    self.screen.push_decision(d)
             except Exception:
                 pass
         elif event.type == EventType.SYSTEM_STAT_UPDATE:
             state.cpu_percent = event.data.get("cpu", 0.0)
             state.ram_percent = event.data.get("ram", 0.0)
         elif event.type == EventType.SCAN_PROGRESS:
+            # Ignore trailing progress events from a scan we already cancelled
+            # locally; wait for SCAN_COMPLETE to close it out.
+            if self._scan_cancel_requested:
+                return
+
             # Live scan progress — update scan widgets immediately
             d = event.data
             state.last_scan_files_scanned = d.get("files_scanned", 0)
             state.last_scan_threats_found = d.get("threats_found_count", state.last_scan_threats_found)
+
+            # Track that daemon has an active scan (for S-key reconnection)
+            self._daemon_scan_active = True
+            # Estimate start time if we just reconnected mid-scan
+            if not self._scan_start_time:
+                files = d.get("files_scanned", 0)
+                self._scan_start_time = time.time() - max(files * 0.01, 1.0)
 
             try:
                 scan_widget = self.query_one("#scan-panel", ScanStatsWidget)
@@ -984,6 +1285,14 @@ class CyberPetApp(App):
                     filelog.add_file(current_file)
                 except Exception:
                     pass
+
+            # Forward to active ScanScreen's event queue
+            try:
+                from cyberpet.ui.scan_screen import ScanScreen
+                if isinstance(self.screen, ScanScreen) and hasattr(self.screen, '_event_queue') and self.screen._event_queue is not None:
+                    self.screen._event_queue.put_nowait(event)
+            except Exception:
+                pass
 
         # Add to event log
         try:
@@ -1096,6 +1405,17 @@ class CyberPetApp(App):
                         filelog.add_file(current_file)
                     except Exception:
                         pass
+            elif item.type == EventType.SCAN_STARTED:
+                self._daemon_scan_active = True
+                self._scan_start_time = time.time()
+                try:
+                    scan_widget = self.query_one("#scan-panel", ScanStatsWidget)
+                    scan_widget.scan_active = True
+                    scan_widget.scan_percent = 0
+                    scan_widget.scan_speed = 0.0
+                    scan_widget.files_scanned = 0
+                except Exception:
+                    pass
 
             elif item.type == EventType.THREAT_FOUND:
                 self.notify(
@@ -1111,8 +1431,16 @@ class CyberPetApp(App):
 
         self._refresh_stats_widget()
 
-        # Increment uptime
-        state.uptime_seconds += 2
+        # Uptime: read daemon's real start time from PID file
+        try:
+            pid_file = "/var/run/cyberpet.pid"
+            if os.path.exists(pid_file):
+                daemon_start = os.path.getmtime(pid_file)
+                state.uptime_seconds = int(time.time() - daemon_start)
+            else:
+                state.uptime_seconds += 2
+        except OSError:
+            state.uptime_seconds += 2
 
     def _refresh_stats_widget(self) -> None:
         """Push latest state values into stats and brain widgets."""
@@ -1144,11 +1472,12 @@ class CyberPetApp(App):
         try:
             scan_widget = self.query_one("#scan-panel", ScanStatsWidget)
 
-            # Check if scan is currently running
-            is_scanning = self._active_scan_state is not None
-            scan_widget.scan_active = is_scanning
+            # Use daemon scan flag, but never display active scanning while a
+            # local cancel request is waiting to be finalized.
+            is_scanning = self._daemon_scan_active and not self._scan_cancel_requested
 
             if not is_scanning:
+                scan_widget.scan_active = False
                 if state.last_scan_time > 0:
                     stamp = datetime.fromtimestamp(state.last_scan_time).strftime("%H:%M:%S")
                     scan_name = state.last_scan_type or "scan"
@@ -1189,25 +1518,54 @@ class CyberPetApp(App):
     def action_open_brain(self) -> None:
         """Open the Brain Screen for detailed RL brain view."""
         try:
-            self.push_screen(BrainScreen())
+            screen = BrainScreen(initial_decisions=list(self._rl_decisions))
+            self.push_screen(screen)
         except Exception as exc:
             self.notify(f"Brain screen error: {exc}", severity="error")
 
+    def action_clear_log(self) -> None:
+        """Clear the main TUI event log widget and persisted events file."""
+        try:
+            # Query from the base screen (index 0) so we always hit the main
+            # TUI's #event-log, not the brain screen's log
+            main_screen = self.screen_stack[0]
+            log_widget = main_screen.query_one("#event-log", EventLogWidget)
+            log_widget.clear_log()
+        except Exception:
+            pass
+        # Also clear persisted events file
+        try:
+            events_file = "/var/log/cyberpet/events.jsonl"
+            if os.path.exists(events_file):
+                with open(events_file, "w") as f:
+                    f.truncate(0)
+        except Exception:
+            pass
+        self.notify("Log cleared", severity="information")
+
     def action_open_scan_menu(self) -> None:
         """Open the scan type selection modal, or return to active scan."""
-        # If a scan is running in the background, create a NEW screen
-        # that reconnects to the running scan state
-        if self._active_scan_state is not None:
+        # If a daemon scan is running, open ScanScreen in monitoring mode
+        if self._daemon_scan_active and not self._scan_cancel_requested:
             try:
+                recent_files: list[str] = []
+                try:
+                    filelog = self.query_one("#scan-filelog", ScanFileLogWidget)
+                    recent_files = list(getattr(filelog, "_files", []))
+                except Exception:
+                    recent_files = []
                 screen = ScanScreen(
-                    scan_type=self._active_scan_state.get("scan_type", "quick"),
-                    reconnect_state=self._active_scan_state,
+                    scan_type="quick",
+                    monitoring=True,
+                    monitor_start=self._scan_start_time or time.time(),
+                    monitor_files=self.pet_state.last_scan_files_scanned,
+                    monitor_recent_files=recent_files,
+                    monitor_paused=self._daemon_scan_paused,
                 )
-                self._active_scan_state = None  # consumed by the new screen
                 self.push_screen(screen)
                 return
             except Exception:
-                self._active_scan_state = None
+                pass
         try:
             self.push_screen(ScanMenuModal(), callback=self._on_scan_menu_result)
         except Exception as exc:

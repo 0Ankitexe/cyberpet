@@ -10,13 +10,16 @@ If any match, the action is aborted with ``false_positive=True``.
 
 from __future__ import annotations
 
+import asyncio  # Issue 5: single module-level import
 import logging
 import os
+import time
 import signal
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from cyberpet.events import Event, EventBus, EventType
+from cyberpet.scan_trigger import append_trigger_command, read_trigger_commands
 
 if TYPE_CHECKING:
     from cyberpet.false_positive_memory import FalsePositiveMemory
@@ -89,7 +92,8 @@ class ActionExecutor:
         # Safe set from prior knowledge (sha256, filepath)
         try:
             self._safe_set: set[tuple[str, str]] = prior.get_safe_file_penalty_set()
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to load safe set from priors: {exc}")
             self._safe_set = set()
 
         # Current target context, set externally before execute()
@@ -144,8 +148,8 @@ class ActionExecutor:
                     target_in_fp_memory=True,
                     details=f"Aborted: {filepath} is in FP memory",
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"FP memory check failed: {exc}")
 
         # Check prior safe set
         if (sha256, filepath) in self._safe_set:
@@ -170,6 +174,16 @@ class ActionExecutor:
                 )
 
         return None
+
+    # ── Async event publishing helper ──────────────────────────────────
+
+    def _publish_event(self, event: Event) -> None:
+        """Publish event to EventBus, handling async context safely."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._bus.publish(event))
+        except RuntimeError:
+            logger.debug(f"No event loop to publish {event.type}")
 
     # ── Action implementations ─────────────────────────────────────────
 
@@ -236,35 +250,29 @@ class ActionExecutor:
             })()
 
             if self._vault:
-                import asyncio
                 try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(self._vault.quarantine_file(filepath, threat))
                 except RuntimeError:
-                    pass
+                    logger.warning("No event loop for quarantine — skipping async quarantine")
 
             self._pet.files_quarantined += 1
 
             # Record confirmation in FP memory
             try:
                 self._fp.record_quarantine_confirmation(threat)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"Failed to record quarantine confirmation: {exc}")
 
             # Publish QUARANTINE_CONFIRMED event
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._bus.publish(Event(
-                    type=EventType.QUARANTINE_CONFIRMED,
-                    source="action_executor",
-                    data={"filepath": filepath,
-                          "sha256": self._current_target.get("sha256", ""),
-                          "category": self._current_target.get("category", "")},
-                    severity=70,
-                )))
-            except RuntimeError:
-                pass
+            self._publish_event(Event(
+                type=EventType.QUARANTINE_CONFIRMED,
+                source="action_executor",
+                data={"filepath": filepath,
+                      "sha256": self._current_target.get("sha256", ""),
+                      "category": self._current_target.get("category", "")},
+                severity=70,
+            ))
 
             return ActionResult(
                 action=action,
@@ -274,6 +282,7 @@ class ActionExecutor:
                 details=f"Quarantined {filepath}",
             )
         except Exception as exc:
+            logger.error(f"Quarantine failed for {filepath}: {exc}")
             return ActionResult(
                 action=action, success=False,
                 details=f"Quarantine failed: {exc}",
@@ -302,17 +311,12 @@ class ActionExecutor:
                 logger.warning(f"iptables isolation failed: {exc}")
 
         # Publish LOCKDOWN_ACTIVATED event
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._bus.publish(Event(
-                type=EventType.LOCKDOWN_ACTIVATED,
-                source="action_executor",
-                data={"action": "network_isolate", "pid": pid},
-                severity=80,
-            )))
-        except RuntimeError:
-            pass
+        self._publish_event(Event(
+            type=EventType.LOCKDOWN_ACTIVATED,
+            source="action_executor",
+            data={"action": "network_isolate", "pid": pid},
+            severity=80,
+        ))
 
         return ActionResult(
             action=action,
@@ -328,24 +332,18 @@ class ActionExecutor:
         # Attempt restore from quarantine vault
         if self._vault and filepath != "unknown":
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 loop.create_task(self._vault.restore_file(filepath))
-            except (RuntimeError, AttributeError):
-                pass
+            except (RuntimeError, AttributeError) as exc:
+                logger.debug(f"Restore async failed: {exc}")
 
         # Publish LOCKDOWN_DEACTIVATED event (restore = de-escalation)
-        try:
-            import asyncio
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._bus.publish(Event(
-                type=EventType.LOCKDOWN_DEACTIVATED,
-                source="action_executor",
-                data={"action": "restore_file", "filepath": filepath},
-                severity=30,
-            )))
-        except RuntimeError:
-            pass
+        self._publish_event(Event(
+            type=EventType.LOCKDOWN_DEACTIVATED,
+            source="action_executor",
+            data={"action": "restore_file", "filepath": filepath},
+            severity=30,
+        ))
 
         return ActionResult(
             action=action, success=True,
@@ -354,9 +352,32 @@ class ActionExecutor:
 
     def _action_trigger_scan(self, action: int) -> ActionResult:
         trigger = "/var/run/cyberpet_scan_trigger"
+
+        # Cooldown: don't spam scans — check if one completed recently
         try:
-            with open(trigger, "w") as f:
-                f.write("quick")
+            if hasattr(self, "_pet") and self._pet:
+                last_scan = getattr(self._pet, "last_scan_time", 0)
+                if last_scan and (time.time() - last_scan) < 300:
+                    return ActionResult(
+                        action=action, success=True,
+                        details="Scan skipped (cooldown — last scan was <5 min ago)",
+                    )
+        except Exception:
+            pass
+
+        # Don't trigger if there's already a pending trigger
+        try:
+            existing = read_trigger_commands(trigger)
+            if any(cmd in ("quick", "full") for cmd in existing):
+                return ActionResult(
+                    action=action, success=True,
+                    details="Scan already pending",
+                )
+        except OSError:
+            pass
+
+        try:
+            append_trigger_command("quick", trigger_file=trigger)
             return ActionResult(
                 action=action, success=True,
                 details="Quick scan triggered",
@@ -394,17 +415,12 @@ class ActionExecutor:
             logger.warning(f"Lockdown iptables failed: {exc}")
 
         # Publish LOCKDOWN_ACTIVATED event
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._bus.publish(Event(
-                type=EventType.LOCKDOWN_ACTIVATED,
-                source="action_executor",
-                data={"action": "escalate_lockdown", "pid": pid},
-                severity=100,
-            )))
-        except RuntimeError:
-            pass
+        self._publish_event(Event(
+            type=EventType.LOCKDOWN_ACTIVATED,
+            source="action_executor",
+            data={"action": "escalate_lockdown", "pid": pid},
+            severity=100,
+        ))
 
         return ActionResult(
             action=action,

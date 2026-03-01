@@ -506,6 +506,7 @@ class FileScanner:
 
     async def quick_scan(
         self, cancel_token: CancellationToken | None = None,
+        pause_event: asyncio.Event | None = None,
     ) -> ScanReport:
         """Quick scan — starts scanning immediately, discovers targets in parallel."""
         report = ScanReport(scan_type="quick", start_time=datetime.now())
@@ -517,17 +518,20 @@ class FileScanner:
         ))
 
         await self._scan_streaming(
-            collector=self._collect_quick_targets,
+            collector=self._collect_quick_targets_streaming,
             report=report,
             cancel_token=cancel_token,
+            pause_event=pause_event,
         )
 
         report.end_time = datetime.now()
-        await self._publish_complete(report)
+        cancelled = bool(cancel_token and cancel_token.is_cancelled())
+        await self._publish_complete(report, cancelled=cancelled)
         return report
 
     async def full_scan(
         self, cancel_token: CancellationToken | None = None,
+        pause_event: asyncio.Event | None = None,
     ) -> ScanReport:
         """Full scan — starts scanning immediately, discovers targets in parallel."""
         report = ScanReport(scan_type="full", start_time=datetime.now())
@@ -539,13 +543,15 @@ class FileScanner:
         ))
 
         await self._scan_streaming(
-            collector=self._collect_full_targets,
+            collector=self._collect_full_targets_streaming,
             report=report,
             cancel_token=cancel_token,
+            pause_event=pause_event,
         )
 
         report.end_time = datetime.now()
-        await self._publish_complete(report)
+        cancelled = bool(cancel_token and cancel_token.is_cancelled())
+        await self._publish_complete(report, cancelled=cancelled)
         return report
 
     async def _scan_streaming(
@@ -553,6 +559,7 @@ class FileScanner:
         collector: Any,
         report: ScanReport,
         cancel_token: CancellationToken | None = None,
+        pause_event: asyncio.Event | None = None,
     ) -> None:
         """Producer-consumer scan: discover and scan files simultaneously.
 
@@ -561,19 +568,33 @@ class FileScanner:
         Scanning starts within milliseconds — zero wait for full collection.
         """
         import queue as stdlib_queue
+        import threading
 
         file_queue: stdlib_queue.Queue[str | None] = stdlib_queue.Queue(maxsize=500)
         total_discovered = [0]  # mutable counter shared with producer thread
+        producer_cancel = threading.Event()
 
         def _producer() -> None:
             """Run collector in a thread; push files into queue one by one."""
             try:
                 targets = collector()
                 for fp in targets:
-                    file_queue.put(fp)
-                    total_discovered[0] += 1
+                    if producer_cancel.is_set():
+                        break
+                    # Use bounded put timeout so cancellation can interrupt even
+                    # when the queue is full.
+                    while not producer_cancel.is_set():
+                        try:
+                            file_queue.put(fp, timeout=0.1)
+                            total_discovered[0] += 1
+                            break
+                        except stdlib_queue.Full:
+                            continue
             finally:
-                file_queue.put(None)  # sentinel: collection done
+                # On cancellation the consumer exits early and may stop draining;
+                # avoid blocking forever trying to enqueue a sentinel.
+                if not producer_cancel.is_set():
+                    file_queue.put(None)  # sentinel: collection done
 
         # Start the producer in a background thread
         loop = asyncio.get_event_loop()
@@ -585,7 +606,12 @@ class FileScanner:
 
         while True:
             if cancel_token and cancel_token.is_cancelled():
+                producer_cancel.set()
                 break
+
+            # Pause gate — blocks here until resumed
+            if pause_event is not None:
+                await pause_event.wait()
 
             # Try to grab a batch of files from the queue (non-blocking)
             batch: list[str] = []
@@ -610,7 +636,11 @@ class FileScanner:
             # Scan the batch
             for filepath in batch:
                 if cancel_token and cancel_token.is_cancelled():
+                    producer_cancel.set()
                     break
+                # Pause gate per-file
+                if pause_event is not None:
+                    await pause_event.wait()
                 try:
                     record = await loop.run_in_executor(
                         self._executor, self._analyze_file, filepath, report
@@ -637,8 +667,9 @@ class FileScanner:
                     report.files_scanned += 1
                     files_scanned += 1
 
-                # Progress every 5 files
-                if files_scanned % 5 == 0:
+                # Emit progress early (first few files) and then every 5 files.
+                # This keeps the UI responsive at scan start without flooding.
+                if files_scanned <= 5 or files_scanned % 5 == 0:
                     total_est = total_discovered[0]
 
                     if collection_done and total_est > 0:
@@ -854,6 +885,83 @@ class FileScanner:
 
         return priority_1 + priority_2 + priority_3 + priority_4
 
+    def _collect_quick_targets_streaming(self):
+        """Yield quick-scan targets incrementally for immediate progress updates.
+
+        This avoids the long "silent" phase where all targets are collected
+        before scanning starts.
+        """
+        seen: set[str] = set()
+
+        def _emit(fp: str):
+            if fp in seen:
+                return None
+            seen.add(fp)
+            return fp
+
+        # 1) High-risk staging areas
+        for scan_dir in ("/tmp", "/dev/shm", "/var/tmp"):
+            for fp in self._walk_dir_iter(scan_dir, max_depth=5):
+                out = _emit(fp)
+                if out:
+                    yield out
+
+        # 2) Cron persistence
+        for cron_dir in ("/var/spool/cron/crontabs", "/etc/cron.d"):
+            if os.path.isdir(cron_dir):
+                try:
+                    for entry in os.scandir(cron_dir):
+                        if entry.is_file():
+                            out = _emit(entry.path)
+                            if out:
+                                yield out
+                except OSError:
+                    pass
+        if os.path.isfile("/etc/crontab"):
+            out = _emit("/etc/crontab")
+            if out:
+                yield out
+
+        # 3) Systemd persistence
+        systemd_dir = "/etc/systemd/system"
+        if os.path.isdir(systemd_dir):
+            try:
+                for entry in os.scandir(systemd_dir):
+                    if entry.name.endswith(".service") and entry.is_file():
+                        out = _emit(entry.path)
+                        if out:
+                            yield out
+            except OSError:
+                pass
+
+        # 4) Dangerous file types under /home and /root
+        for search_dir in ("/home", "/root"):
+            for fp in self._walk_dir_iter(search_dir, max_depth=20):
+                try:
+                    st = os.lstat(fp)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if st.st_size > self.max_file_size or st.st_size == 0:
+                        continue
+                    if self._is_dangerous_file(fp):
+                        out = _emit(fp)
+                        if out:
+                            yield out
+                except OSError:
+                    pass
+
+        # 5) Recently modified files in /home and /root
+        cutoff = time.time() - 86400
+        for search_dir in ("/home", "/root"):
+            for fp in self._walk_dir_iter(search_dir, max_depth=20):
+                try:
+                    if os.stat(fp).st_mtime > cutoff:
+                        out = _emit(fp)
+                        if out:
+                            yield out
+                except OSError:
+                    pass
+
     def _collect_full_targets(self) -> list[str]:
         """Walk the ENTIRE filesystem. No date filter, no type filter.
 
@@ -901,6 +1009,22 @@ class FileScanner:
 
         return priority_1 + priority_2 + priority_3 + priority_4
 
+    def _collect_full_targets_streaming(self):
+        """Yield full-scan targets incrementally for live UI feedback."""
+        for root, dirs, files in os.walk("/"):
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in _SKIP_PATHS]
+            for fname in files:
+                fp = os.path.join(root, fname)
+                try:
+                    st = os.lstat(fp)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if st.st_size > self.max_file_size or st.st_size == 0:
+                        continue
+                    yield fp
+                except OSError:
+                    continue
+
     @staticmethod
     def _walk_dir(directory: str, max_depth: int = 10) -> list[str]:
         """Recursively list regular files, respecting max depth."""
@@ -921,6 +1045,25 @@ class FileScanner:
                 except OSError:
                     pass
         return results
+
+    @staticmethod
+    def _walk_dir_iter(directory: str, max_depth: int = 10):
+        """Recursively yield regular files, respecting max depth."""
+        if not os.path.isdir(directory):
+            return
+        base_depth = directory.rstrip("/").count("/")
+        for root, dirs, files in os.walk(directory):
+            depth = root.rstrip("/").count("/") - base_depth
+            if depth >= max_depth:
+                dirs.clear()
+                continue
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    if os.path.isfile(fp) and not os.path.islink(fp):
+                        yield fp
+                except OSError:
+                    pass
 
     # ── Scan loop ───────────────────────────────────────────────────
 
@@ -1166,7 +1309,7 @@ class FileScanner:
 
     # ── Event publishing ────────────────────────────────────────────
 
-    async def _publish_complete(self, report: ScanReport) -> None:
+    async def _publish_complete(self, report: ScanReport, cancelled: bool = False) -> None:
         """Publish scan completion event with audit summary."""
         total = report.files_scanned
         await self.event_bus.publish(Event(
@@ -1174,6 +1317,7 @@ class FileScanner:
             source="scanner",
             data={
                 "scan_type": report.scan_type,
+                "cancelled": bool(cancelled),
                 "files_scanned": total,
                 "threats_found_count": len(report.threats_found),
                 "duration_seconds": report.scan_duration_seconds,
