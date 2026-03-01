@@ -35,6 +35,7 @@ class PetState:
         last_scan_threats_found: Number of threats found in last scan.
         files_quarantined: Total files currently in quarantine.
         last_threat_name: Name/category of the most recent threat found.
+        scan_in_progress: Whether a scanner run is currently active.
     """
 
     cpu_percent: float = 0.0
@@ -54,6 +55,7 @@ class PetState:
     files_quarantined: int = 0
     last_threat_name: str = ""
     last_scan_duration: float = 0.0
+    scan_in_progress: bool = False
     # V3 RL fields
     rl_steps_trained: int = 0
     rl_last_action: str = ""

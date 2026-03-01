@@ -280,6 +280,12 @@ class ScanScheduler:
         if not cmd:
             return
 
+        # Source-aware quick-scan trigger from RL brain.
+        is_rl_quick_trigger = False
+        if cmd in ("quick_rl", "rl_quick", "quick:rl", "rl:quick"):
+            cmd = "quick"
+            is_rl_quick_trigger = True
+
         if cmd in ("cancel", "stop"):
             if self._scanning:
                 log_info("Cancel requested via trigger", module="scheduler")
@@ -319,6 +325,12 @@ class ScanScheduler:
         # If cancel is in progress, remember one explicit user trigger and run
         # it after cancellation finalizes.
         if self._scanning and self._cancel_requested:
+            if is_rl_quick_trigger:
+                log_info(
+                    "Ignoring RL quick scan trigger (cancel in progress)",
+                    module="scheduler",
+                )
+                return
             self._deferred_scan_cmd = cmd
             log_info(
                 f"Deferring {cmd} scan until cancel completes",
@@ -329,18 +341,27 @@ class ScanScheduler:
         if cmd == "full":
             self._track_task(asyncio.create_task(self._run_full_scan()))
         else:
-            self._track_task(asyncio.create_task(self._run_quick_scan()))
+            self._track_task(
+                asyncio.create_task(self._run_quick_scan(from_rl=is_rl_quick_trigger))
+            )
 
-    async def _run_quick_scan(self) -> None:
+    async def _run_quick_scan(self, from_rl: bool = False) -> None:
         """Execute a quick scan and handle results."""
         if self._scanning:
             if self._cancel_requested:
                 log_info("Quick scan ignored (scan cancel in progress)", module="scheduler")
                 return
+            if from_rl:
+                log_info(
+                    "Ignoring RL quick scan trigger (scan already running)",
+                    module="scheduler",
+                )
+                return
             self._pending_quick = True
             log_info("Quick scan queued (scan already running)", module="scheduler")
             return
         self._scanning = True
+        self.pet_state.scan_in_progress = True
         self._cancel_token = CancellationToken()
         pause_event = self._ensure_pause_event()
         pause_event.set()  # reset pause state
@@ -369,6 +390,7 @@ class ScanScheduler:
         finally:
             was_cancelled = bool(self._cancel_token and self._cancel_token.is_cancelled())
             self._scanning = False
+            self.pet_state.scan_in_progress = False
             self._paused = False
             self._cancel_token = None
             self._ensure_pause_event().set()
@@ -422,6 +444,7 @@ class ScanScheduler:
             log_info("Full scan queued (scan already running)", module="scheduler")
             return
         self._scanning = True
+        self.pet_state.scan_in_progress = True
         self._cancel_token = CancellationToken()
         pause_event = self._ensure_pause_event()
         pause_event.set()
@@ -450,6 +473,7 @@ class ScanScheduler:
         finally:
             was_cancelled = bool(self._cancel_token and self._cancel_token.is_cancelled())
             self._scanning = False
+            self.pet_state.scan_in_progress = False
             self._paused = False
             self._cancel_token = None
             self._ensure_pause_event().set()

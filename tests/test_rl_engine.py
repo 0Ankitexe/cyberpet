@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import builtins
 from unittest.mock import MagicMock, patch
 
 from cyberpet.events import Event, EventBus, EventType
@@ -81,6 +82,31 @@ class TestRLEngineInit(unittest.TestCase):
             engine.initialize()
 
             self.assertEqual(engine._warmup_steps, 100)
+
+    def test_initialize_raises_when_sb3_missing(self) -> None:
+        """Missing SB3 should fail fast so daemon doesn't run a dead RL loop."""
+        try:
+            from cyberpet.rl_engine import RLEngine
+        except ImportError:
+            self.skipTest("RL dependencies not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bus = EventBus()
+            fp = _FakeFPMemory()
+            hist = _FakeScanHistory()
+            config = _FakeConfig(tmpdir)
+            engine = RLEngine(config, bus, fp, hist)
+
+            original_import = builtins.__import__
+
+            def _fake_import(name, *args, **kwargs):
+                if name == "stable_baselines3":
+                    raise ImportError("simulated missing sb3")
+                return original_import(name, *args, **kwargs)
+
+            with patch("builtins.__import__", side_effect=_fake_import):
+                with self.assertRaises(RuntimeError):
+                    engine.initialize()
 
 
 class TestRLEngineModelPersistence(unittest.TestCase):

@@ -201,6 +201,29 @@ class TestActionExecutorUS4FullActions(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertIn("scan", result.details.lower())
 
+    @patch("cyberpet.action_executor.append_trigger_command")
+    @patch("cyberpet.action_executor.read_trigger_commands", return_value=[])
+    def test_trigger_scan_uses_rl_specific_command(self, _read_mock, append_mock) -> None:
+        ae = self._make_executor()
+        result = ae.execute(6)
+        self.assertTrue(result.success)
+        self.assertTrue(result.scan_triggered)
+        append_mock.assert_called_once_with(
+            "quick_rl",
+            trigger_file="/var/run/cyberpet_scan_trigger",
+        )
+
+    @patch("cyberpet.action_executor.append_trigger_command")
+    @patch("cyberpet.action_executor.read_trigger_commands")
+    def test_trigger_scan_attaches_when_scan_already_running(self, read_mock, append_mock) -> None:
+        ae = self._make_executor()
+        ae._pet.scan_in_progress = True
+        result = ae.execute(6)
+        self.assertTrue(result.success)
+        self.assertTrue(result.scan_attached)
+        read_mock.assert_not_called()
+        append_mock.assert_not_called()
+
     def test_log_warn_detects_suspicious(self) -> None:
         ae = self._make_executor()
         result = ae.execute(1)

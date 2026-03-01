@@ -178,7 +178,9 @@ class RLEngine:
             from stable_baselines3 import PPO
         except ImportError:
             logger.error("stable-baselines3 not installed — RL engine disabled")
-            return
+            raise RuntimeError(
+                "stable-baselines3 not installed in daemon interpreter"
+            )
 
         if os.path.exists(model_path):
             try:

@@ -24,6 +24,8 @@ class _ActionResult:
     threat_category: str = ""
     missed_threat: bool = False
     confidence_scale: float = 1.0
+    scan_triggered: bool = False
+    scan_attached: bool = False
     details: str = ""
 
 
@@ -130,6 +132,21 @@ class TestCyberPetEnvRewards(unittest.TestCase):
         result = _ActionResult(action=2)  # BLOCK_PROCESS when no threat
         reward = env.calculate_reward(2, state, result)
         self.assertLess(reward, 0.0)
+
+    def test_trigger_scan_attached_gets_positive_reward(self) -> None:
+        env = self._make_env()
+        state = np.zeros(STATE_DIM, dtype=np.float32)
+        result = _ActionResult(action=6, success=True, scan_attached=True)
+        reward = env.calculate_reward(6, state, result)
+        self.assertGreater(reward, 0.0)
+
+    def test_trigger_scan_not_penalized_as_unnecessary_action(self) -> None:
+        env = self._make_env()
+        state = np.zeros(STATE_DIM, dtype=np.float32)
+        state[30] = 0.01  # very low threat
+        result = _ActionResult(action=6, success=True)
+        reward = env.calculate_reward(6, state, result)
+        self.assertGreaterEqual(reward, 0.0)
 
 
 if __name__ == "__main__":

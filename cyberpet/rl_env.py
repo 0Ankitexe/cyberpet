@@ -196,6 +196,13 @@ class CyberPetEnv(gym.Env):
         if action_result.suspicious_detected and action in (1, 2, 6):
             reward += 5.0
 
+        # Scan action: reward both fresh trigger and attached intent.
+        if action == 6 and action_result.success:
+            if getattr(action_result, "scan_triggered", False):
+                reward += 0.8
+            elif getattr(action_result, "scan_attached", False):
+                reward += 0.6
+
         # System stability (low anomaly + low threat)
         if has_anomaly and has_threat:
             if new_state[IDX_ANOMALY_SCORE] < 0.2 and new_state[IDX_THREAT_HISTORY_0] < 0.1:
@@ -215,7 +222,7 @@ class CyberPetEnv(gym.Env):
             reward += base_penalty
 
         # Unnecessary action when no threat
-        if action != 0 and not action_result.confirmed_threat and not action_result.suspicious_detected:
+        if action not in (0, 6) and not action_result.confirmed_threat and not action_result.suspicious_detected:
             if has_threat and new_state[IDX_THREAT_HISTORY_0] < 0.05:
                 reward -= 3.0
 

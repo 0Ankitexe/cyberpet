@@ -55,6 +55,8 @@ class ActionResult:
     threat_category: str = ""
     missed_threat: bool = False
     confidence_scale: float = 1.0
+    scan_triggered: bool = False
+    scan_attached: bool = False
     details: str = ""
 
 
@@ -353,6 +355,19 @@ class ActionExecutor:
     def _action_trigger_scan(self, action: int) -> ActionResult:
         trigger = "/var/run/cyberpet_scan_trigger"
 
+        # If a scan is already running (typically user-triggered), RL scan
+        # intent can attach to that run instead of requesting a second scan.
+        try:
+            if bool(getattr(self._pet, "scan_in_progress", False)):
+                return ActionResult(
+                    action=action,
+                    success=True,
+                    scan_attached=True,
+                    details="Scan already active — attached to in-progress scan",
+                )
+        except Exception:
+            pass
+
         # Cooldown: don't spam scans — check if one completed recently
         try:
             if hasattr(self, "_pet") and self._pet:
@@ -368,18 +383,20 @@ class ActionExecutor:
         # Don't trigger if there's already a pending trigger
         try:
             existing = read_trigger_commands(trigger)
-            if any(cmd in ("quick", "full") for cmd in existing):
+            if any(cmd in ("quick", "full", "quick_rl", "rl_quick") for cmd in existing):
                 return ActionResult(
                     action=action, success=True,
+                    scan_attached=True,
                     details="Scan already pending",
                 )
         except OSError:
             pass
 
         try:
-            append_trigger_command("quick", trigger_file=trigger)
+            append_trigger_command("quick_rl", trigger_file=trigger)
             return ActionResult(
                 action=action, success=True,
+                scan_triggered=True,
                 details="Quick scan triggered",
             )
         except OSError:

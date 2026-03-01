@@ -372,6 +372,51 @@ class ScanSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(history.claimed, ["full"])
                 self.assertEqual(len(history.cancelled), 1)
 
+    async def test_rl_trigger_is_ignored_while_scan_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._build_config(tmpdir)
+            scanner = _BlockingScanner()
+            with (
+                patch("cyberpet.scan_scheduler.HashDatabase", _FakeHashDatabase),
+                patch("cyberpet.scan_scheduler.YaraEngine", _FakeYaraEngine),
+                patch("cyberpet.scan_scheduler.QuarantineVault", _FakeQuarantineVault),
+                patch("cyberpet.scan_scheduler.FileScanner", return_value=scanner),
+            ):
+                scheduler = ScanScheduler(config, EventBus(), PetState())
+                scheduler._running = True
+
+                full_task = asyncio.create_task(scheduler._run_full_scan())
+                await scanner.full_started.wait()
+
+                await scheduler._handle_trigger_command("quick_rl")
+                self.assertFalse(scheduler._pending_quick)
+                self.assertTrue(scheduler.pet_state.scan_in_progress)
+
+                scanner.allow_full_finish.set()
+                await full_task
+
+                self.assertEqual(scanner.full_calls, 1)
+                self.assertEqual(scanner.quick_calls, 0)
+                self.assertFalse(scheduler.pet_state.scan_in_progress)
+
+    async def test_rl_trigger_runs_when_scheduler_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._build_config(tmpdir)
+            scanner = _ControllableScanner()
+            with (
+                patch("cyberpet.scan_scheduler.HashDatabase", _FakeHashDatabase),
+                patch("cyberpet.scan_scheduler.YaraEngine", _FakeYaraEngine),
+                patch("cyberpet.scan_scheduler.QuarantineVault", _FakeQuarantineVault),
+                patch("cyberpet.scan_scheduler.FileScanner", return_value=scanner),
+            ):
+                scheduler = ScanScheduler(config, EventBus(), PetState())
+                scheduler._running = True
+
+                await scheduler._handle_trigger_command("quick_rl")
+                await asyncio.sleep(0.1)
+
+                self.assertEqual(scanner.quick_calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

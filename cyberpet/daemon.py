@@ -609,7 +609,7 @@ class CyberPetDaemon:
             if not os.path.exists(control_file):
                 with open(control_file, "w") as f:
                     f.write("paused")
-                os.chmod(control_file, 0o666)
+            os.chmod(control_file, 0o666)
         except OSError:
             pass
 
@@ -644,6 +644,12 @@ class CyberPetDaemon:
                         if cmd == "start" and not rl_running:
                             rl_running = True
                             log_info("RL training STARTED (via control command)", module="daemon")
+                            try:
+                                with open(control_file, "w") as f:
+                                    f.write("running")
+                                os.chmod(control_file, 0o666)
+                            except OSError:
+                                pass
                         elif cmd == "stop" and rl_running:
                             rl_running = False
                             self.pet_state.rl_state = "PAUSED"
@@ -662,6 +668,12 @@ class CyberPetDaemon:
                                 )
                             except Exception:
                                 pass
+                            try:
+                                with open(control_file, "w") as f:
+                                    f.write("paused")
+                                os.chmod(control_file, 0o666)
+                            except OSError:
+                                pass
                 except OSError:
                     pass
 
@@ -670,7 +682,20 @@ class CyberPetDaemon:
                     await asyncio.sleep(2)  # Check control file every 2s
                     continue
 
-                step_info = self._rl_engine.run_step()
+                try:
+                    step_info = self._rl_engine.run_step()
+                except Exception as exc:
+                    log_error(f"RL run_step failed: {exc}", module="daemon")
+                    self.pet_state.rl_state = "ERROR"
+                    await asyncio.sleep(2)
+                    continue
+
+                if not isinstance(step_info, dict) or step_info.get("error"):
+                    err = step_info.get("error", "unknown error") if isinstance(step_info, dict) else "invalid step payload"
+                    log_error(f"RL engine step error: {err}", module="daemon")
+                    self.pet_state.rl_state = "ERROR"
+                    await asyncio.sleep(2)
+                    continue
 
                 # Update pet state
                 self.pet_state.rl_steps_trained = self._rl_engine.total_steps

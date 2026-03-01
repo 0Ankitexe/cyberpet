@@ -17,6 +17,29 @@ import psutil  # type: ignore[import]
 
 from cyberpet.scan_trigger import append_trigger_command
 
+_VENV_PYTHON = "/opt/cyberpet/venv/bin/python"
+
+
+def _preferred_python() -> str:
+    """Return preferred interpreter for daemon/TUI runtime."""
+    candidate = os.environ.get("CYBERPET_PYTHON", _VENV_PYTHON)
+    if candidate and os.path.exists(candidate):
+        return candidate
+    return sys.executable
+
+
+def _maybe_reexec_start(no_reexec: bool = False) -> None:
+    """Re-exec start command into preferred interpreter when available."""
+    if no_reexec:
+        return
+    preferred = _preferred_python()
+    if os.path.abspath(preferred) == os.path.abspath(sys.executable):
+        return
+    os.execv(
+        preferred,
+        [preferred, "-m", "cyberpet", "start", "--no-reexec"],
+    )
+
 
 @click.group()
 def main() -> None:
@@ -25,8 +48,11 @@ def main() -> None:
 
 
 @main.command()
-def start() -> None:
+@click.option("--no-reexec", is_flag=True, hidden=True, default=False)
+def start(no_reexec: bool) -> None:
     """Start the CyberPet daemon in the background."""
+    _maybe_reexec_start(no_reexec=no_reexec)
+
     # Check root (needed for system paths)
     if os.getuid() != 0:
         click.echo("Error: Root privileges required to start CyberPet daemon", err=True)
@@ -171,7 +197,8 @@ def pet() -> None:
 
     if os.geteuid() != 0:
         print("[cyberpet] Starting with sudo for system access...")
-        args = ["sudo", sys.executable, "-m", "cyberpet", "pet"] + sys.argv[2:]
+        runtime_python = _preferred_python()
+        args = ["sudo", runtime_python, "-m", "cyberpet", "pet"] + sys.argv[2:]
         os.execvp("sudo", args)
         return  # pragma: no cover
 
@@ -536,6 +563,10 @@ def model_start():
     try:
         with open(_RL_CONTROL_FILE, "w") as f:
             f.write("start")
+        try:
+            os.chmod(_RL_CONTROL_FILE, 0o666)
+        except OSError:
+            pass
         click.echo("🧠 RL training STARTED")
         click.echo()
         click.echo("  The pet will now begin learning from system observations.")
@@ -565,6 +596,10 @@ def model_stop():
     try:
         with open(_RL_CONTROL_FILE, "w") as f:
             f.write("stop")
+        try:
+            os.chmod(_RL_CONTROL_FILE, 0o666)
+        except OSError:
+            pass
         click.echo("⏸  RL training PAUSED")
         click.echo()
         click.echo("  The model and progress are preserved.")
