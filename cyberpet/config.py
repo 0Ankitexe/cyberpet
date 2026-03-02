@@ -83,6 +83,7 @@ _FALLBACK_CONFIG: dict[str, Any] = {
         "model_path": "/var/lib/cyberpet/models/",
         "decision_interval_seconds": 30,
         "checkpoint_interval_steps": 3600,
+        "checkpoint_interval_seconds": 1800,
         "warmup_steps_no_priors": 100,
         "warmup_steps_with_priors": 50,
         "warmup_steps_deep_priors": 25,

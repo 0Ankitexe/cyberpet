@@ -1,0 +1,29 @@
+{
+  "animationsEnabled": true,
+  "busFactor": 70,
+  "churnNormalizationPercentile": 90,
+  "colorScheme": "default",
+  "commit_guard": {
+    "block_on_critical": false,
+    "enabled": true,
+    "warn_threshold_delta": 10
+  },
+  "criticalThreshold": 80,
+  "gitHistoryDays": 90,
+  "nodeLabel": "always",
+  "notificationsEnabled": true,
+  "schema_version": 2,
+  "snapshotRetention": 52,
+  "snapshotSchedule": "weekly",
+  "warningThreshold": 65,
+  "weights": {
+    "change_coupling": 0.12,
+    "churn_rate": 0.22,
+    "code_smell_density": 0.2,
+    "coupling_index": 0.18,
+    "cyclomatic_complexity": 0.05,
+    "decision_staleness": 0.03,
+    "knowledge_concentration": 0.08,
+    "test_coverage_gap": 0.12
+  }
+}

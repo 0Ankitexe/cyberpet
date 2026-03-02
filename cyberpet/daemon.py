@@ -654,6 +654,11 @@ class CyberPetDaemon:
                             rl_running = False
                             self.pet_state.rl_state = "PAUSED"
                             log_info("RL training PAUSED (via control command)", module="daemon")
+                            # Flush a model checkpoint immediately on pause.
+                            try:
+                                self._rl_engine.save_checkpoint()
+                            except Exception as exc:
+                                log_warn(f"Failed to checkpoint on pause: {exc}", module="daemon")
                             # Write paused state
                             try:
                                 _json.dump(

@@ -318,6 +318,48 @@ class TestRLEngineNetworkActionRemap(unittest.TestCase):
             self.assertEqual(step_info.get("action"), 0)
             self.assertEqual(step_info.get("action_name"), "ALLOW")
 
+
+class TestRLEngineCheckpointing(unittest.TestCase):
+    """Checkpoint behavior for step/time driven saves."""
+
+    def test_run_step_triggers_checkpoint_when_time_due(self) -> None:
+        from cyberpet.rl_engine import RLEngine
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bus = EventBus()
+            fp = _FakeFPMemory()
+            hist = _FakeScanHistory()
+            config = _FakeConfig(tmpdir, allow_network_actions=False)
+
+            engine = RLEngine(config, bus, fp, hist)
+            engine._initialized = True
+            engine._warmup_steps = 0
+            engine._total_steps = 1
+            engine._model = _PredictModel(0)
+            engine._env = _StepEnv()
+            engine._checkpoint_interval = 100000
+            engine._checkpoint_interval_seconds = 1
+            engine._last_checkpoint_time = 0.0
+
+            with patch.object(engine, "save_checkpoint") as save_mock:
+                engine.run_step()
+                save_mock.assert_called_once()
+
+    def test_save_checkpoint_updates_last_checkpoint_time(self) -> None:
+        from cyberpet.rl_engine import RLEngine
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bus = EventBus()
+            fp = _FakeFPMemory()
+            hist = _FakeScanHistory()
+            config = _FakeConfig(tmpdir)
+
+            engine = RLEngine(config, bus, fp, hist)
+            engine.initialize()
+            before = engine._last_checkpoint_time
+            engine.save_checkpoint()
+            self.assertGreaterEqual(engine._last_checkpoint_time, before)
+
     def test_escalate_lockdown_action_is_remapped_to_allow(self) -> None:
         from cyberpet.rl_engine import RLEngine
 

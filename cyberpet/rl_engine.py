@@ -42,6 +42,7 @@ _DESTRUCTIVE_FALLBACK = {              # destructive → safe fallback
 
 # Default PPO batch size (n_steps) — model trains after this many steps
 _DEFAULT_N_STEPS = 512
+_DEFAULT_CHECKPOINT_INTERVAL_SECONDS = 1800
 
 
 class RLEngine:
@@ -76,6 +77,10 @@ class RLEngine:
         if isinstance(rl_cfg, dict):
             self._model_dir = rl_cfg.get("model_path", "/var/lib/cyberpet/models/")
             self._checkpoint_interval = rl_cfg.get("checkpoint_interval_steps", 240)
+            self._checkpoint_interval_seconds = rl_cfg.get(
+                "checkpoint_interval_seconds",
+                _DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+            )
             self._warmup_no_priors = rl_cfg.get("warmup_steps_no_priors", 100)
             self._warmup_with_priors = rl_cfg.get("warmup_steps_with_priors", 50)
             self._warmup_deep = rl_cfg.get("warmup_steps_deep_priors", 25)
@@ -85,6 +90,11 @@ class RLEngine:
         else:
             self._model_dir = getattr(rl_cfg, "model_path", "/var/lib/cyberpet/models/")
             self._checkpoint_interval = getattr(rl_cfg, "checkpoint_interval_steps", 240)
+            self._checkpoint_interval_seconds = getattr(
+                rl_cfg,
+                "checkpoint_interval_seconds",
+                _DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+            )
             self._warmup_no_priors = getattr(rl_cfg, "warmup_steps_no_priors", 100)
             self._warmup_with_priors = getattr(rl_cfg, "warmup_steps_with_priors", 50)
             self._warmup_deep = getattr(rl_cfg, "warmup_steps_deep_priors", 25)
@@ -100,6 +110,7 @@ class RLEngine:
         self._total_steps: int = 0
         self._warmup_steps: int = self._warmup_no_priors
         self._last_checkpoint_step: int = 0
+        self._last_checkpoint_time: float = time.time()
         self._safe_file_set: set[tuple[str, str]] = set()
         self._action_counts: dict[int, int] = {i: 0 for i in range(8)}
         self._reward_history: deque[float] = deque(maxlen=1000)  # Issue 3: bounded
@@ -300,11 +311,16 @@ class RLEngine:
         self._action_counts[action] = self._action_counts.get(action, 0) + 1
         self._reward_history.append(float(reward))
 
-        # Checkpoint
-        if (
+        # Checkpoint by steps or elapsed wall clock time.
+        steps_due = (
             self._total_steps - self._last_checkpoint_step
             >= self._checkpoint_interval
-        ):
+        )
+        time_due = (
+            self._checkpoint_interval_seconds > 0
+            and (time.time() - self._last_checkpoint_time) >= self._checkpoint_interval_seconds
+        )
+        if steps_due or time_due:
             self.save_checkpoint()
 
         from cyberpet.action_executor import ACTION_NAMES
@@ -341,6 +357,7 @@ class RLEngine:
         try:
             self._model.save(model_path)
             self._last_checkpoint_step = self._total_steps
+            self._last_checkpoint_time = time.time()
             logger.info(
                 f"Checkpoint saved at step {self._total_steps}: {model_path}"
             )
